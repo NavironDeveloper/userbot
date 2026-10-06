@@ -6,6 +6,7 @@ from threading import Thread
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl import types
 from telethon.tl.types import PeerUser, PeerChat, PeerChannel, MessageMediaPhoto, MessageMediaDocument
 import telebot
@@ -13,9 +14,16 @@ import telebot
 # === СЕКРЕТЫ ===
 load_dotenv()
 
-api_id = int(os.getenv('API_ID'))
+api_id_raw = os.getenv('API_ID')
 api_hash = os.getenv('API_HASH')
 token = os.getenv('BOT_TOKEN')
+session_string = os.getenv('SESSION_STRING', '')
+
+missing = [k for k, v in {'API_ID': api_id_raw, 'API_HASH': api_hash, 'BOT_TOKEN': token}.items() if not v]
+if missing:
+    raise RuntimeError(f"Отсутствуют переменные окружения: {', '.join(missing)}")
+
+api_id = int(api_id_raw)
 
 bot = telebot.TeleBot(token)
 client = None  # создаётся в main()
@@ -686,7 +694,7 @@ def register_handlers(c):
 
 async def main():
     global client, owner_id
-    client = TelegramClient('ub', api_id, api_hash)
+    client = TelegramClient(StringSession(session_string), api_id, api_hash)
     register_handlers(client)
 
     await client.start()
