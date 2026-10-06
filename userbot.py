@@ -708,6 +708,10 @@ def callback_handler(call):
             parse_mode='HTML', reply_markup=kb
         )
 
+    elif data.startswith('ttt_') and data != 'ttt_noop':
+        handle_ttt_callback(call)
+        return
+
     bot.answer_callback_query(call.id)
 
 
@@ -1326,6 +1330,345 @@ async def clear_deleted_handler(event):
         print(f"Clear deleted error: {e}")
 
 
+# =====================================================
+# === .DOX — ФЕЙК ДОКС ===
+# =====================================================
+
+async def dox_handler(event):
+    if not await check_is_owner(event):
+        return
+    try:
+        reply = await event.get_reply_message()
+        if not reply:
+            await event.edit('❌ Ответьте на сообщение пользователя.')
+            return
+
+        user_id = reply.sender_id
+        username, name, user = await get_user_info(user_id)
+        target_name = name or username or str(user_id)
+        username_display = f'@{username}' if username else '—'
+
+        # Фейковые данные
+        fake_cities = ['Москва', 'Санкт-Петербург', 'Новосибирск', 'Екатеринбург', 'Казань', 'Нижний Новгород', 'Челябинск', 'Самара', 'Омск', 'Ростов-на-Дону']
+        fake_providers = ['МТС', 'Билайн', 'МегаФон', 'Теле2', 'Ростелеком']
+        fake_devices = ['iPhone 14 Pro', 'Samsung Galaxy S23', 'Xiaomi 13', 'Google Pixel 7', 'OnePlus 11']
+        fake_banks = ['Сбербанк', 'Тинькофф', 'ВТБ', 'Альфа-Банк', 'Газпромбанк']
+        city = random.choice(fake_cities)
+        provider = random.choice(fake_providers)
+        device = random.choice(fake_devices)
+        bank = random.choice(fake_banks)
+        fake_phone = f'+7{random.randint(900,999)}{random.randint(1000000,9999999)}'
+        fake_ip = f'{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}'
+        fake_coords = f'{random.uniform(55.0, 60.0):.4f}° N, {random.uniform(37.0, 44.0):.4f}° E'
+
+        # Анимация сбора данных
+        stages = [
+            f'🔍 <b>[ ИНИЦИАЛИЗАЦИЯ ПОИСКА ]</b>\n\n<code>TARGET: {target_name}</code>\n<code>ID: {user_id}</code>\n\n⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ 0%',
+            f'🔍 <b>[ СКАНИРОВАНИЕ БАЗ ДАННЫХ ]</b>\n\n<code>TARGET: {target_name}</code>\n<code>ID: {user_id}</code>\n\n🟩⬛⬛⬛⬛⬛⬛⬛⬛⬛ 10%\n\n<code>» Подключение к базам...\n» Авторизация: OK\n» Поиск совпадений...</code>',
+            f'🔎 <b>[ АНАЛИЗ АККАУНТА ]</b>\n\n<code>TARGET: {target_name}</code>\n<code>ID: {user_id}</code>\n\n🟩🟩🟩⬛⬛⬛⬛⬛⬛⬛ 30%\n\n<code>» Username: {username_display}\n» Telegram ID: {user_id}\n» Анализ метаданных...</code>',
+            f'📡 <b>[ ГЕОЛОКАЦИЯ ]</b>\n\n<code>TARGET: {target_name}</code>\n<code>ID: {user_id}</code>\n\n🟩🟩🟩🟩🟩⬛⬛⬛⬛⬛ 50%\n\n<code>» IP адрес: {fake_ip}\n» Провайдер: {provider}\n» Определение города...</code>',
+            f'📱 <b>[ УСТРОЙСТВО И КОНТАКТЫ ]</b>\n\n<code>TARGET: {target_name}</code>\n<code>ID: {user_id}</code>\n\n🟩🟩🟩🟩🟩🟩🟩⬛⬛⬛ 70%\n\n<code>» Устройство: {device}\n» Телефон: {fake_phone}\n» Привязанный банк: {bank}...</code>',
+            f'💾 <b>[ ФИНАЛИЗАЦИЯ ]</b>\n\n<code>TARGET: {target_name}</code>\n<code>ID: {user_id}</code>\n\n🟩🟩🟩🟩🟩🟩🟩🟩🟩⬛ 90%\n\n<code>» Компиляция данных...\n» Шифрование отчёта...\n» Почти готово...</code>',
+            (
+                f'☠️ <b>[ ДОСЬЕ ГОТОВО ]</b>\n\n'
+                f'<code>━━━━━━━━━━━━━━━━━━━━\n'
+                f'  СУБЪЕКТ: {target_name}\n'
+                f'━━━━━━━━━━━━━━━━━━━━</code>\n\n'
+                f'👤 <b>Имя:</b> <code>{name or "Скрыто"}</code>\n'
+                f'🔗 <b>Username:</b> <code>{username_display}</code>\n'
+                f'🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n'
+                f'📞 <b>Телефон:</b> <code>{fake_phone}</code>\n'
+                f'🌍 <b>Город:</b> <code>{city}</code>\n'
+                f'📍 <b>Координаты:</b> <code>{fake_coords}</code>\n'
+                f'🌐 <b>IP:</b> <code>{fake_ip}</code>\n'
+                f'📡 <b>Провайдер:</b> <code>{provider}</code>\n'
+                f'📱 <b>Устройство:</b> <code>{device}</code>\n'
+                f'🏦 <b>Банк:</b> <code>{bank}</code>\n\n'
+                f'<code>⚠️ ДАННЫЕ ПОЛУЧЕНЫ ИЗ ОТКРЫТЫХ ИСТОЧНИКОВ\n'
+                f'   [FAKE DOX — ТОЛЬКО ДЛЯ РАЗВЛЕЧЕНИЯ]</code>'
+            ),
+        ]
+
+        delays = [0.8, 1.2, 1.5, 1.5, 1.5, 1.2]
+
+        await event.edit(stages[0], parse_mode='HTML')
+        for i, (stage, delay) in enumerate(zip(stages[1:], delays)):
+            await asyncio.sleep(delay)
+            await event.edit(stage, parse_mode='HTML')
+
+    except Exception as e:
+        print(f"Dox error: {e}")
+        await event.edit('❌ Ошибка.')
+
+
+# =====================================================
+# === .DEANON — ФЕЙК ДЕАНОН ===
+# =====================================================
+
+async def deanon_handler(event):
+    if not await check_is_owner(event):
+        return
+    try:
+        reply = await event.get_reply_message()
+        if not reply:
+            await event.edit('❌ Ответьте на сообщение пользователя.')
+            return
+
+        user_id = reply.sender_id
+        username, name, _ = await get_user_info(user_id)
+        target_name = name or username or str(user_id)
+
+        fake_leaks = ['VK_LEAKED_2021', 'GOSUSLUGI_DB', 'SBERBANK_2022', 'AVITO_DUMP', 'HH_RU_BASE', 'DELIVERY_CLUB_2020', 'YANDEX_FOOD_LEAK']
+        fake_emails = [f'{username or "user"}{random.randint(10,99)}@gmail.com', f'{username or "user"}{random.randint(10,99)}@mail.ru', f'id{user_id % 10000}@yandex.ru']
+        fake_vk = f'vk.com/id{random.randint(10000000, 999999999)}'
+        fake_reg_date = f'{random.randint(2015,2022)}-{random.randint(1,12):02d}-{random.randint(1,28):02d}'
+        found_leaks = random.sample(fake_leaks, k=random.randint(2, 4))
+
+        stages = [
+            f'🕵️ <b>[ ДЕАНОНИМИЗАЦИЯ ]</b>\n\n<code>ЦЕЛЬ: {target_name}</code>\n\n⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ 0%\n\n<code>Инициализация поиска по утечкам...</code>',
+            f'🕵️ <b>[ ПОИСК ПО УТЕЧКАМ ]</b>\n\n<code>ЦЕЛЬ: {target_name}</code>\n\n🟥🟥🟥⬛⬛⬛⬛⬛⬛⬛ 30%\n\n<code>» Проверка {fake_leaks[0]}... НАЙДЕНО\n» Проверка {fake_leaks[1]}... НАЙДЕНО\n» Проверка {fake_leaks[2]}... НЕТ</code>',
+            f'🕵️ <b>[ СОПОСТАВЛЕНИЕ ДАННЫХ ]</b>\n\n<code>ЦЕЛЬ: {target_name}</code>\n\n🟥🟥🟥🟥🟥🟥⬛⬛⬛⬛ 60%\n\n<code>» ВКонтакте: {fake_vk}\n» Email совпадение: ДА\n» Дата регистрации: {fake_reg_date}</code>',
+            f'🕵️ <b>[ ФИНАЛИЗАЦИЯ ]</b>\n\n<code>ЦЕЛЬ: {target_name}</code>\n\n🟥🟥🟥🟥🟥🟥🟥🟥🟥⬛ 90%\n\n<code>» Сборка профиля...\n» Верификация данных...</code>',
+            (
+                f'☠️ <b>[ ДЕАНОН ЗАВЕРШЁН ]</b>\n\n'
+                f'👤 <b>Цель:</b> <code>{target_name}</code>\n'
+                f'🔗 <b>Username:</b> <code>{"@" + username if username else "—"}</code>\n'
+                f'🆔 <b>ID:</b> <code>{user_id}</code>\n\n'
+                f'📧 <b>Email из утечек:</b>\n'
+                + ''.join([f'<code>  » {e}</code>\n' for e in fake_emails[:2]]) +
+                f'\n🔵 <b>ВКонтакте:</b> <code>{fake_vk}</code>\n'
+                f'📅 <b>Регистрация:</b> <code>{fake_reg_date}</code>\n\n'
+                f'💾 <b>Найдено в базах ({len(found_leaks)}):</b>\n'
+                + ''.join([f'<code>  » {l}</code>\n' for l in found_leaks]) +
+                f'\n<code>⚠️ [FAKE DEANON — ТОЛЬКО ДЛЯ РАЗВЛЕЧЕНИЯ]</code>'
+            ),
+        ]
+
+        delays = [1.0, 1.5, 1.5, 1.2]
+
+        await event.edit(stages[0], parse_mode='HTML')
+        for stage, delay in zip(stages[1:], delays):
+            await asyncio.sleep(delay)
+            await event.edit(stage, parse_mode='HTML')
+
+    except Exception as e:
+        print(f"Deanon error: {e}")
+        await event.edit('❌ Ошибка.')
+
+
+# =====================================================
+# === .FCO — ПРЕДСКАЗАНИЯ НА ДЕНЬ ===
+# =====================================================
+
+PREDICTIONS = [
+    ('♈ Овен', '🔥 Сегодня звёзды дают тебе силу. Действуй смело — всё получится. Удача на твоей стороне в делах и общении.'),
+    ('♉ Телец', '💚 День благоприятен для финансов. Не упусти шанс который появится во второй половине дня. Берегись суеты.'),
+    ('♊ Близнецы', '💨 Твоя коммуникабельность сегодня — главный козырь. Новые знакомства принесут пользу. Избегай конфликтов.'),
+    ('♋ Рак', '🌊 День эмоциональный. Прислушайся к интуиции — она не подведёт. Вечер проведи с близкими.'),
+    ('♌ Лев', '☀️ Твоё время! Сегодня ты в центре внимания. Используй это для важных переговоров и решений.'),
+    ('♍ Дева', '🌿 Аналитический ум поможет решить давнюю проблему. День подходит для планирования и порядка.'),
+    ('♎ Весы', '⚖️ Гармония достижима — ищи компромисс. Сегодня важно не откладывать на завтра то что можно сделать сейчас.'),
+    ('♏ Скорпион', '🖤 Мощная энергия сегодня. Трансформация неизбежна. Не бойся перемен — они ведут к лучшему.'),
+    ('♐ Стрелец', '🏹 Стремись к цели без остановок. Удача сопутствует смелым. Новые горизонты ждут тебя.'),
+    ('♑ Козерог', '🏔 Упорство принесёт плоды. Сегодня не время для сомнений — действуй по плану. Вечером заслуженный отдых.'),
+    ('♒ Водолей', '⚡ Оригинальные идеи придут неожиданно. Доверяй им. Сегодня можно удивить всех своим нестандартным подходом.'),
+    ('♓ Рыбы', '🌙 Интуиция на пике. Творческий день — займись тем что давно откладывал. Избегай негативных людей.'),
+]
+
+async def fco_handler(event):
+    if not await check_is_owner(event):
+        return
+    try:
+        # Псевдослучайный выбор на основе даты и user_id (стабильный в течение дня)
+        today = datetime.now().strftime('%Y%m%d')
+        seed = int(today) + (event.message.sender_id or 0)
+        random.seed(seed)
+        sign, prediction = random.choice(PREDICTIONS)
+        random.seed()  # сбрасываем seed
+
+        lucky_numbers = sorted(random.sample(range(1, 50), 3))
+        lucky_color_list = ['🔴 Красный', '🟠 Оранжевый', '🟡 Жёлтый', '🟢 Зелёный', '🔵 Синий', '🟣 Фиолетовый', '⚪ Белый', '⚫ Чёрный', '🟤 Коричневый']
+        lucky_color = random.choice(lucky_color_list)
+        energy = random.randint(60, 100)
+
+        bar_filled = energy // 10
+        energy_bar = '🟩' * bar_filled + '⬛' * (10 - bar_filled)
+
+        text = (
+            f'🔮 <b>Предсказание на {datetime.now().strftime("%d.%m.%Y")}</b>\n\n'
+            f'<blockquote>{sign}\n\n'
+            f'{prediction}\n\n'
+            f'⚡ Энергия дня: {energy_bar} {energy}%\n'
+            f'🍀 Счастливые числа: <b>{", ".join(map(str, lucky_numbers))}</b>\n'
+            f'🎨 Цвет дня: <b>{lucky_color}</b></blockquote>'
+        )
+        await event.edit(text, parse_mode='HTML')
+    except Exception as e:
+        print(f"FCO error: {e}")
+        await event.edit('❌ Ошибка предсказания.')
+
+
+# =====================================================
+# === .TTT — КРЕСТИКИ НОЛИКИ ===
+# =====================================================
+
+# Хранилище игр: chat_id -> {board, current_player, msg_id, player_x, player_o}
+ttt_games = {}
+
+def ttt_board_to_text(board, last_move=None):
+    symbols = {0: '⬜', 1: '❌', 2: '⭕'}
+    rows = []
+    for r in range(3):
+        row = []
+        for c in range(3):
+            idx = r * 3 + c
+            row.append(symbols[board[idx]])
+        rows.append(' '.join(row))
+    return '\n'.join(rows)
+
+def ttt_check_winner(board):
+    wins = [
+        [0,1,2],[3,4,5],[6,7,8],  # строки
+        [0,3,6],[1,4,7],[2,5,8],  # столбцы
+        [0,4,8],[2,4,6]           # диагонали
+    ]
+    for combo in wins:
+        if board[combo[0]] != 0 and board[combo[0]] == board[combo[1]] == board[combo[2]]:
+            return board[combo[0]]
+    if all(c != 0 for c in board):
+        return -1  # ничья
+    return 0  # игра продолжается
+
+def ttt_make_keyboard(board, game_id):
+    symbols = {0: '⬜', 1: '❌', 2: '⭕'}
+    kb = tb_types.InlineKeyboardMarkup(row_width=3)
+    buttons = []
+    for i, cell in enumerate(board):
+        if cell == 0:
+            buttons.append(tb_types.InlineKeyboardButton('⬜', callback_data=f'ttt_{game_id}_{i}'))
+        else:
+            buttons.append(tb_types.InlineKeyboardButton(symbols[cell], callback_data=f'ttt_noop'))
+    kb.add(*buttons)
+    return kb
+
+async def ttt_handler(event):
+    if not await check_is_owner(event):
+        return
+    try:
+        chat_id = event.chat_id
+        reply = await event.get_reply_message()
+
+        if not reply:
+            await event.edit('❌ Ответьте на сообщение противника чтобы начать игру.')
+            return
+
+        opponent_id = reply.sender_id
+        if opponent_id == event.message.sender_id:
+            await event.edit('❌ Нельзя играть с самим собой.')
+            return
+
+        game_id = str(chat_id)
+        ttt_games[game_id] = {
+            'board': [0] * 9,
+            'current': 1,  # 1 = X (владелец), 2 = O (противник)
+            'player_x': event.message.sender_id,
+            'player_o': opponent_id,
+            'chat_id': chat_id,
+        }
+
+        owner_name = (await client.get_me()).first_name or 'Игрок 1'
+        try:
+            opp_entity = await client.get_entity(opponent_id)
+            opp_name = opp_entity.first_name or 'Игрок 2'
+        except Exception:
+            opp_name = 'Игрок 2'
+
+        board_text = ttt_board_to_text([0]*9)
+        text = (
+            f'🎮 <b>Крестики-Нолики</b>\n\n'
+            f'❌ {owner_name} vs ⭕ {opp_name}\n\n'
+            f'{board_text}\n\n'
+            f'Ход: ❌ <b>{owner_name}</b>'
+        )
+
+        await event.delete()
+
+        # Отправляем через бот чтобы можно было использовать инлайн кнопки
+        loop = asyncio.get_event_loop()
+        kb = ttt_make_keyboard([0]*9, game_id)
+        await loop.run_in_executor(None, lambda: bot.send_message(
+            chat_id, text, parse_mode='HTML', reply_markup=kb
+        ))
+
+    except Exception as e:
+        print(f"TTT error: {e}")
+        await event.edit('❌ Ошибка запуска игры.')
+
+
+# Обработка ходов крестиков-ноликов через callback
+def handle_ttt_callback(call):
+    parts = call.data.split('_')
+    if len(parts) != 3:
+        return
+    _, game_id, cell_str = parts
+    cell = int(cell_str)
+    user_id = call.from_user.id
+
+    if game_id not in ttt_games:
+        bot.answer_callback_query(call.id, '❌ Игра не найдена или завершена.')
+        return
+
+    game = ttt_games[game_id]
+    board = game['board']
+    current = game['current']
+
+    # Проверяем чей ход
+    if current == 1 and user_id != game['player_x']:
+        bot.answer_callback_query(call.id, '⏳ Сейчас не ваш ход!')
+        return
+    if current == 2 and user_id != game['player_o']:
+        bot.answer_callback_query(call.id, '⏳ Сейчас не ваш ход!')
+        return
+
+    if board[cell] != 0:
+        bot.answer_callback_query(call.id, '❌ Клетка занята!')
+        return
+
+    board[cell] = current
+    winner = ttt_check_winner(board)
+
+    try:
+        px_entity_name = call.from_user.first_name or 'Игрок'
+    except Exception:
+        px_entity_name = 'Игрок'
+
+    if winner != 0:
+        board_text = ttt_board_to_text(board)
+        if winner == -1:
+            result_text = f'🤝 <b>Ничья!</b>'
+        else:
+            symbol = '❌' if winner == 1 else '⭕'
+            result_text = f'{symbol} <b>{px_entity_name} победил!</b>'
+
+        text = f'🎮 <b>Крестики-Нолики — Игра завершена</b>\n\n{board_text}\n\n{result_text}'
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML')
+        del ttt_games[game_id]
+    else:
+        game['current'] = 2 if current == 1 else 1
+        next_symbol = '❌' if game['current'] == 1 else '⭕'
+        board_text = ttt_board_to_text(board)
+        text = (
+            f'🎮 <b>Крестики-Нолики</b>\n\n'
+            f'{board_text}\n\n'
+            f'Ход: {next_symbol} <b>{"Игрок X" if game["current"]==1 else "Игрок O"}</b>'
+        )
+        kb = ttt_make_keyboard(board, game_id)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=kb)
+
+    bot.answer_callback_query(call.id)
+
+
 HELP_TEXT = """<b>📝 Команды UserBot</b>
 
 <blockquote>▫️ .help — Справка
@@ -1338,7 +1681,11 @@ HELP_TEXT = """<b>📝 Команды UserBot</b>
 ▫️ .unafk — Выключить AFK режим
 ▫️ .ping — Проверить задержку
 ▫️ .stats — Статистика бота
-▫️ .clear — Очистить базу удалённых</blockquote>"""
+▫️ .clear — Очистить базу удалённых
+▫️ .dox — Фейк досье на пользователя (реплай)
+▫️ .deanon — Фейк деанон (реплай)
+▫️ .fco — Предсказание на день
+▫️ .ttt — Крестики-нолики (реплай)</blockquote>"""
 
 
 async def help_handler(event):
@@ -1355,6 +1702,10 @@ async def help_handler(event):
             'deleted': '⚙️ Deleted\n\n· .deleted [N] — Последние N удалённых (макс 20)',
             'afk': '⚙️ AFK\n\n· .afk [причина] — Включить AFK\n· .unafk — Выключить AFK',
             'stats': '⚙️ Stats\n\n· .stats — Статистика бота',
+            'dox': '⚙️ Dox\n\n· .dox — Фейк досье (в ответ на сообщение)\n⚠️ Только для развлечения',
+            'deanon': '⚙️ Deanon\n\n· .deanon — Фейк деанон (в ответ на сообщение)\n⚠️ Только для развлечения',
+            'fco': '⚙️ Forecast\n\n· .fco — Предсказание на сегодня',
+            'ttt': '⚙️ TicTacToe\n\n· .ttt — Крестики-нолики (в ответ на сообщение противника)',
         }
         await event.edit(helps.get(command, HELP_TEXT), parse_mode='HTML')
     else:
@@ -1423,6 +1774,10 @@ def register_handlers(c):
     c.add_event_handler(ping_handler, events.NewMessage(outgoing=True, pattern=r'^\.ping$'))
     c.add_event_handler(stats_handler, events.NewMessage(outgoing=True, pattern=r'^\.stats$'))
     c.add_event_handler(clear_deleted_handler, events.NewMessage(outgoing=True, pattern=r'^\.clear$'))
+    c.add_event_handler(dox_handler, events.NewMessage(outgoing=True, pattern=r'^\.dox$'))
+    c.add_event_handler(deanon_handler, events.NewMessage(outgoing=True, pattern=r'^\.deanon$'))
+    c.add_event_handler(fco_handler, events.NewMessage(outgoing=True, pattern=r'^\.fco$'))
+    c.add_event_handler(ttt_handler, events.NewMessage(outgoing=True, pattern=r'^\.ttt$'))
 
     c.add_event_handler(handler_message_edited, events.MessageEdited)
 
