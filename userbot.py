@@ -1,7 +1,9 @@
 import asyncio
 import sqlite3
 import os
-from datetime import datetime
+import json
+import random
+from datetime import datetime, timedelta
 from threading import Thread
 
 from dotenv import load_dotenv
@@ -10,6 +12,7 @@ from telethon.sessions import StringSession
 from telethon.tl import types
 from telethon.tl.types import PeerUser, PeerChat, PeerChannel, MessageMediaPhoto, MessageMediaDocument
 import telebot
+from telebot import types as tb_types
 
 # === СЕКРЕТЫ ===
 load_dotenv()
@@ -25,15 +28,19 @@ if missing:
 
 api_id = int(api_id_raw)
 
+# Суперадмин (неизменяем, задаётся здесь)
+SUPERADMIN_ID = 8179854758
+
 bot = telebot.TeleBot(token)
 client = None  # создаётся в main()
 
-# Папка для хранения медиафайлов удалённых сообщений
 MEDIA_DIR = 'deleted_media'
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 conn = sqlite3.connect('userbot.db', check_same_thread=False)
 cursor = conn.cursor()
+
+# === ТАБЛИЦЫ БД ===
 
 cursor.execute('''CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
@@ -45,7 +52,9 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS messages (
     media_type TEXT,
     date TEXT
 )''')
+
 cursor.execute('''CREATE TABLE IF NOT EXISTS muted_users (user_id INTEGER PRIMARY KEY)''')
+
 cursor.execute('''CREATE TABLE IF NOT EXISTS deleted_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     msg_id INTEGER,
@@ -58,7 +67,39 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS deleted_messages (
     deleted_at TEXT
 )''')
 
-# Миграция: добавляем колонки если их нет (для существующих БД)
+# admins: user_id, username, first_name, added_at
+cursor.execute('''CREATE TABLE IF NOT EXISTS admins (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    added_at TEXT
+)''')
+
+# bot_users: user_id, username, first_name, status (pending/approved/banned), joined_at
+cursor.execute('''CREATE TABLE IF NOT EXISTS bot_users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    status TEXT DEFAULT 'pending',
+    joined_at TEXT
+)''')
+
+# reminders: id, user_id, text, remind_at
+cursor.execute('''CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    text TEXT,
+    remind_at TEXT
+)''')
+
+# afk: user_id, reason, since
+cursor.execute('''CREATE TABLE IF NOT EXISTS afk (
+    user_id INTEGER PRIMARY KEY,
+    reason TEXT,
+    since TEXT
+)''')
+
+# Миграция: добавляем колонки если их нет
 existing_columns = {row[1] for row in cursor.execute('PRAGMA table_info(messages)')}
 if 'media_path' not in existing_columns:
     cursor.execute('ALTER TABLE messages ADD COLUMN media_path TEXT')
@@ -67,9 +108,44 @@ if 'media_type' not in existing_columns:
 
 conn.commit()
 
+# Добавляем суперадмина в таблицу admins при старте
+cursor.execute('INSERT OR IGNORE INTO admins (user_id, username, first_name, added_at) VALUES (?, ?, ?, ?)',
+               (SUPERADMIN_ID, 'superadmin', 'SuperAdmin', datetime.now().isoformat()))
+conn.commit()
+
 stored_messages = {}
 owner_id = None
 muted_users = set()
+afk_users = {}  # user_id -> {reason, since}
+
+
+# === ПРОВЕРКА ПРАВ ===
+
+def is_admin(user_id: int) -> bool:
+    cursor.execute('SELECT user_id FROM admins WHERE user_id=?', (user_id,))
+    return cursor.fetchone() is not None
+
+def is_approved(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    cursor.execute('SELECT status FROM bot_users WHERE user_id=?', (user_id,))
+    row = cursor.fetchone()
+    return row is not None and row[0] == 'approved'
+
+def is_superadmin(user_id: int) -> bool:
+    return user_id == SUPERADMIN_ID
+
+def get_user_status_label(user_id: int) -> str:
+    if is_superadmin(user_id):
+        return '👑 Суперадмин'
+    if is_admin(user_id):
+        return '🛡 Админ'
+    cursor.execute('SELECT status FROM bot_users WHERE user_id=?', (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        return '❓ Неизвестен'
+    status_map = {'approved': '✅ Разрешён', 'pending': '⏳ Ожидает', 'banned': '🚫 Заблокирован'}
+    return status_map.get(row[0], row[0])
 
 
 # === ХЕЛПЕРЫ ===
@@ -86,7 +162,6 @@ async def get_user_info(user_id):
 
 
 async def get_chat_title(chat_id):
-    """Возвращает название чата/группы по chat_id."""
     try:
         entity = await client.get_entity(chat_id)
         if hasattr(entity, 'title'):
@@ -98,51 +173,47 @@ async def get_chat_title(chat_id):
     return f"ID:{chat_id}"
 
 
-def send_bot_message_sync(text, media_path=None, media_type=None):
+def send_bot_message_sync(chat_id, text, media_path=None, media_type=None, reply_markup=None):
     try:
         if media_path and os.path.exists(media_path):
             with open(media_path, 'rb') as f:
                 if media_type == 'photo':
-                    bot.send_photo(owner_id, f, caption=text, parse_mode='HTML')
+                    bot.send_photo(chat_id, f, caption=text, parse_mode='HTML', reply_markup=reply_markup)
                 elif media_type == 'video':
-                    bot.send_video(owner_id, f, caption=text, parse_mode='HTML')
+                    bot.send_video(chat_id, f, caption=text, parse_mode='HTML', reply_markup=reply_markup)
                 elif media_type == 'voice':
-                    bot.send_voice(owner_id, f, caption=text, parse_mode='HTML')
+                    bot.send_voice(chat_id, f, caption=text, parse_mode='HTML', reply_markup=reply_markup)
                 elif media_type == 'audio':
-                    bot.send_audio(owner_id, f, caption=text, parse_mode='HTML')
+                    bot.send_audio(chat_id, f, caption=text, parse_mode='HTML', reply_markup=reply_markup)
                 elif media_type == 'sticker':
-                    bot.send_sticker(owner_id, f)
+                    bot.send_sticker(chat_id, f)
                     if text:
-                        bot.send_message(owner_id, text, parse_mode='HTML', disable_web_page_preview=True)
+                        bot.send_message(chat_id, text, parse_mode='HTML', disable_web_page_preview=True, reply_markup=reply_markup)
                 else:
-                    bot.send_document(owner_id, f, caption=text, parse_mode='HTML')
+                    bot.send_document(chat_id, f, caption=text, parse_mode='HTML', reply_markup=reply_markup)
         else:
             if text:
-                bot.send_message(owner_id, text, parse_mode='HTML', disable_web_page_preview=True)
+                bot.send_message(chat_id, text, parse_mode='HTML', disable_web_page_preview=True, reply_markup=reply_markup)
     except Exception as e:
         print(f"Bot send error: {e}")
-        # Фолбэк — просто текст
         try:
             if text:
-                bot.send_message(owner_id, text, parse_mode='HTML', disable_web_page_preview=True)
+                bot.send_message(chat_id, text, parse_mode='HTML', disable_web_page_preview=True)
         except Exception as e2:
             print(f"Bot fallback send error: {e2}")
 
 
-async def send_bot_message(text, media_path=None, media_type=None):
+async def send_bot_message(text, media_path=None, media_type=None, chat_id=None, reply_markup=None):
+    target = chat_id or owner_id
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, send_bot_message_sync, text, media_path, media_type)
+    await loop.run_in_executor(None, send_bot_message_sync, target, text, media_path, media_type, reply_markup)
 
 
 async def check_is_owner(event):
     return event.message.sender_id == owner_id
 
 
-async def download_media_if_exists(message) -> tuple[str | None, str | None]:
-    """
-    Скачивает медиа из сообщения, возвращает (путь, тип) или (None, None).
-    Тип: 'photo', 'video', 'voice', 'audio', 'sticker', 'document'
-    """
+async def download_media_if_exists(message) -> tuple:
     if not message.media:
         return None, None
     try:
@@ -169,7 +240,6 @@ async def download_media_if_exists(message) -> tuple[str | None, str | None]:
                 ext = '.webp'
             else:
                 media_type = 'document'
-                # попытаемся взять оригинальное расширение
                 ext = ''
                 for attr in getattr(doc, 'attributes', []):
                     if hasattr(attr, 'file_name') and attr.file_name:
@@ -189,7 +259,6 @@ async def download_media_if_exists(message) -> tuple[str | None, str | None]:
 
 
 def get_peer_id(peer):
-    """Универсально достаёт числовой ID из PeerUser/PeerChat/PeerChannel."""
     if isinstance(peer, PeerUser):
         return peer.user_id
     if isinstance(peer, PeerChat):
@@ -203,10 +272,9 @@ def is_group_peer(peer):
     return isinstance(peer, (PeerChat, PeerChannel))
 
 
-# === СОХРАНЕНИЕ ВХОДЯЩИХ / ИСХОДЯЩИХ ===
+# === СОХРАНЕНИЕ СООБЩЕНИЙ ===
 
 async def store_message(message):
-    """Сохраняет сообщение в БД и в памяти для последующего отслеживания удалений."""
     try:
         peer = message.peer_id
         chat_id = get_peer_id(peer)
@@ -229,14 +297,9 @@ async def store_message(message):
         print(f"Store error: {e}")
 
 
-# === ОБРАБОТКА УДАЛЕНИЙ ===
+# === УДАЛЁННЫЕ СООБЩЕНИЯ ===
 
-async def on_message_deleted(msg_id: int, chat_id: int | None = None):
-    """
-    Единая точка обработки удалённого сообщения.
-    chat_id может быть None для личных диалогов (UpdateDeleteMessages без chat_id).
-    """
-    # Ищем в БД
+async def on_message_deleted(msg_id: int, chat_id=None):
     if chat_id:
         cursor.execute(
             'SELECT user_id, chat_id, text, media_path, media_type, date '
@@ -255,13 +318,11 @@ async def on_message_deleted(msg_id: int, chat_id: int | None = None):
 
     user_id, found_chat_id, text, media_path, media_type, orig_date = row
 
-    # Сообщения владельца не уведомляем
     if user_id == owner_id:
         cursor.execute('DELETE FROM messages WHERE msg_id=? AND chat_id=?', (msg_id, found_chat_id))
         conn.commit()
         return
 
-    # Сохраняем в таблицу удалённых
     cursor.execute(
         'INSERT INTO deleted_messages (msg_id, user_id, chat_id, text, media_path, media_type, original_date, deleted_at) '
         'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -271,11 +332,9 @@ async def on_message_deleted(msg_id: int, chat_id: int | None = None):
     conn.commit()
     stored_messages.pop((found_chat_id, msg_id), None)
 
-    # Формируем уведомление
     username, name, _ = await get_user_info(user_id)
     link = f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
 
-    # Откуда пришло сообщение
     if found_chat_id != user_id:
         chat_title = await get_chat_title(found_chat_id)
         source = f" в <b>{chat_title}</b>"
@@ -284,14 +343,8 @@ async def on_message_deleted(msg_id: int, chat_id: int | None = None):
 
     media_label = ""
     if media_type:
-        labels = {
-            'photo': '🖼 Фото',
-            'video': '🎬 Видео',
-            'voice': '🎤 Голосовое',
-            'audio': '🎵 Аудио',
-            'sticker': '🎭 Стикер',
-            'document': '📎 Документ',
-        }
+        labels = {'photo': '🖼 Фото', 'video': '🎬 Видео', 'voice': '🎤 Голосовое',
+                  'audio': '🎵 Аудио', 'sticker': '🎭 Стикер', 'document': '📎 Документ'}
         media_label = f"\n{labels.get(media_type, '📎 Медиа')}"
 
     caption = (
@@ -304,26 +357,667 @@ async def on_message_deleted(msg_id: int, chat_id: int | None = None):
 
 
 async def raw_deleted_handler(event):
-    """Обрабатывает UpdateDeleteMessages (личные чаты) и UpdateDeleteChannelMessages (каналы/супергруппы)."""
     try:
-        # event — это сам объект апдейта (UpdateDeleteMessages или UpdateDeleteChannelMessages)
         channel_id = getattr(event, 'channel_id', None)
-
-        # deleted_ids есть в обоих типах апдейта
         msg_ids = getattr(event, 'messages', [])
-
         for msg_id in msg_ids:
             await on_message_deleted(msg_id, chat_id=channel_id)
     except Exception as e:
         print(f"Raw delete error: {e}")
 
 
-# === ПРОСМОТР УДАЛЁННЫХ ===
+# === РЕДАКТИРОВАНИЯ ===
+
+async def process_edited_message(event):
+    if event.message.out:
+        return
+    try:
+        peer = event.message.peer_id
+        chat_id = get_peer_id(peer)
+        if not chat_id:
+            return
+
+        cursor.execute('SELECT text FROM messages WHERE msg_id=? AND chat_id=?', (event.message.id, chat_id))
+        row = cursor.fetchone()
+        if not row:
+            return
+
+        old_text = row[0]
+        new_text = event.message.text or event.message.message or ""
+        if new_text == old_text:
+            return
+
+        user_id = event.message.sender_id
+        if not user_id or user_id == owner_id:
+            return
+
+        username, name, _ = await get_user_info(user_id)
+        link = f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
+
+        if chat_id != user_id:
+            chat_title = await get_chat_title(chat_id)
+            source = f" в <b>{chat_title}</b>"
+        else:
+            source = ""
+
+        message_text = (
+            f"🔏 <a href=\"{link}\">{name}</a> изменил сообщение{source}.\n\n"
+            f"Старый текст:\n<blockquote>{old_text}</blockquote>\n"
+            f"Новый текст:\n<blockquote>{new_text}</blockquote>"
+        )
+        await send_bot_message(message_text)
+
+        cursor.execute('UPDATE messages SET text=? WHERE msg_id=? AND chat_id=?', (new_text, event.message.id, chat_id))
+        conn.commit()
+        stored_messages[(chat_id, event.message.id)] = new_text
+    except Exception as e:
+        print(f"Edit error: {e}")
+
+
+# =====================================================
+# === БОТ: СИСТЕМА ДОСТУПА И АДМИН-ПАНЕЛЬ ===
+# =====================================================
+
+def build_start_keyboard(user_id: int):
+    kb = tb_types.InlineKeyboardMarkup(row_width=2)
+    if is_admin(user_id):
+        kb.add(tb_types.InlineKeyboardButton('🛡 Панель администратора', callback_data='admin_panel'))
+    if is_approved(user_id):
+        kb.add(tb_types.InlineKeyboardButton('📋 Мои команды', callback_data='my_commands'))
+        kb.add(tb_types.InlineKeyboardButton('ℹ️ О боте', callback_data='about'))
+    return kb
+
+
+def build_admin_panel_keyboard():
+    kb = tb_types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        tb_types.InlineKeyboardButton('👥 Заявки на доступ', callback_data='admin_pending'),
+        tb_types.InlineKeyboardButton('✅ Разрешённые пользователи', callback_data='admin_approved'),
+    )
+    kb.add(
+        tb_types.InlineKeyboardButton('🚫 Заблокированные', callback_data='admin_banned'),
+        tb_types.InlineKeyboardButton('👑 Список админов', callback_data='admin_list'),
+    )
+    kb.add(tb_types.InlineKeyboardButton('🔙 Назад', callback_data='back_start'))
+    return kb
+
+
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or ''
+    first_name = message.from_user.first_name or ''
+
+    # Регистрируем пользователя если не существует
+    if not is_superadmin(user_id) and not is_admin(user_id):
+        cursor.execute(
+            'INSERT OR IGNORE INTO bot_users (user_id, username, first_name, status, joined_at) VALUES (?, ?, ?, ?, ?)',
+            (user_id, username, first_name, 'pending', datetime.now().isoformat())
+        )
+        conn.commit()
+
+    status = get_user_status_label(user_id)
+
+    if is_superadmin(user_id) or is_admin(user_id):
+        text = (
+            f"👋 Добро пожаловать, <b>{first_name}</b>!\n\n"
+            f"Статус: {status}\n\n"
+            f"Вы имеете полный доступ к управлению ботом."
+        )
+        bot.send_message(user_id, text, parse_mode='HTML', reply_markup=build_start_keyboard(user_id))
+    elif is_approved(user_id):
+        text = (
+            f"👋 Привет, <b>{first_name}</b>!\n\n"
+            f"Статус: {status}\n\n"
+            f"Вам открыт доступ к боту."
+        )
+        bot.send_message(user_id, text, parse_mode='HTML', reply_markup=build_start_keyboard(user_id))
+    else:
+        # Уведомляем суперадмина о новой заявке
+        row = cursor.execute('SELECT status FROM bot_users WHERE user_id=?', (user_id,)).fetchone()
+        if row and row[0] == 'pending':
+            notify_admins_about_request(user_id, username, first_name)
+
+        text = (
+            f"👋 Привет, <b>{first_name}</b>!\n\n"
+            f"⏳ Ваша заявка на доступ отправлена администратору.\n"
+            f"Ожидайте одобрения."
+        )
+        bot.send_message(user_id, text, parse_mode='HTML')
+
+
+def notify_admins_about_request(user_id, username, first_name):
+    text = (
+        f"🔔 <b>Новая заявка на доступ</b>\n\n"
+        f"👤 Имя: <b>{first_name}</b>\n"
+        f"🔗 Username: {'@' + username if username else 'нет'}\n"
+        f"🆔 ID: <code>{user_id}</code>\n\n"
+        f"Хотите предоставить доступ?"
+    )
+    kb = tb_types.InlineKeyboardMarkup()
+    kb.add(
+        tb_types.InlineKeyboardButton('✅ Разрешить', callback_data=f'approve_{user_id}'),
+        tb_types.InlineKeyboardButton('🚫 Запретить', callback_data=f'ban_{user_id}'),
+    )
+    # Уведомляем всех админов
+    cursor.execute('SELECT user_id FROM admins')
+    for (aid,) in cursor.fetchall():
+        try:
+            bot.send_message(aid, text, parse_mode='HTML', reply_markup=kb)
+        except Exception as e:
+            print(f"Notify admin {aid} error: {e}")
+
+
+@bot.callback_query_handler(func=lambda c: True)
+def callback_handler(call):
+    user_id = call.from_user.id
+    data = call.data
+
+    # --- Кнопки только для админов ---
+    if data == 'admin_panel':
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        bot.edit_message_text(
+            '🛡 <b>Панель администратора</b>\n\nВыберите раздел:',
+            call.message.chat.id, call.message.message_id,
+            parse_mode='HTML', reply_markup=build_admin_panel_keyboard()
+        )
+
+    elif data == 'back_start':
+        first_name = call.from_user.first_name or ''
+        status = get_user_status_label(user_id)
+        text = f"👋 Добро пожаловать, <b>{first_name}</b>!\n\nСтатус: {status}"
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=build_start_keyboard(user_id))
+
+    elif data == 'admin_pending':
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        cursor.execute('SELECT user_id, username, first_name, joined_at FROM bot_users WHERE status=?', ('pending',))
+        rows = cursor.fetchall()
+        if not rows:
+            bot.answer_callback_query(call.id, 'Заявок нет')
+            kb = tb_types.InlineKeyboardMarkup()
+            kb.add(tb_types.InlineKeyboardButton('🔙 Назад', callback_data='admin_panel'))
+            bot.edit_message_text('📭 Нет ожидающих заявок.', call.message.chat.id,
+                                  call.message.message_id, reply_markup=kb)
+            return
+        text = '👥 <b>Ожидающие заявки:</b>\n\n'
+        kb = tb_types.InlineKeyboardMarkup(row_width=2)
+        for uid, uname, fname, joined in rows:
+            uname_display = f'@{uname}' if uname else 'нет'
+            text += f"👤 <b>{fname}</b> ({uname_display})\n🆔 <code>{uid}</code>\n\n"
+            kb.add(
+                tb_types.InlineKeyboardButton(f'✅ {fname}', callback_data=f'approve_{uid}'),
+                tb_types.InlineKeyboardButton(f'🚫 {fname}', callback_data=f'ban_{uid}'),
+            )
+        kb.add(tb_types.InlineKeyboardButton('🔙 Назад', callback_data='admin_panel'))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=kb)
+
+    elif data == 'admin_approved':
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        cursor.execute('SELECT user_id, username, first_name FROM bot_users WHERE status=?', ('approved',))
+        rows = cursor.fetchall()
+        kb = tb_types.InlineKeyboardMarkup()
+        kb.add(tb_types.InlineKeyboardButton('🔙 Назад', callback_data='admin_panel'))
+        if not rows:
+            bot.edit_message_text('📭 Нет разрешённых пользователей.', call.message.chat.id,
+                                  call.message.message_id, reply_markup=kb)
+            return
+        text = '✅ <b>Разрешённые пользователи:</b>\n\n'
+        for uid, uname, fname in rows:
+            uname_display = f'@{uname}' if uname else 'нет'
+            text += f"👤 <b>{fname}</b> ({uname_display}) — <code>{uid}</code>\n"
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=kb)
+
+    elif data == 'admin_banned':
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        cursor.execute('SELECT user_id, username, first_name FROM bot_users WHERE status=?', ('banned',))
+        rows = cursor.fetchall()
+        kb = tb_types.InlineKeyboardMarkup(row_width=1)
+        if rows:
+            for uid, uname, fname in rows:
+                kb.add(tb_types.InlineKeyboardButton(f'♻️ Разблокировать {fname}', callback_data=f'unban_{uid}'))
+        kb.add(tb_types.InlineKeyboardButton('🔙 Назад', callback_data='admin_panel'))
+        if not rows:
+            bot.edit_message_text('📭 Нет заблокированных.', call.message.chat.id,
+                                  call.message.message_id, reply_markup=kb)
+            return
+        text = '🚫 <b>Заблокированные пользователи:</b>\n\n'
+        for uid, uname, fname in rows:
+            uname_display = f'@{uname}' if uname else 'нет'
+            text += f"👤 <b>{fname}</b> ({uname_display}) — <code>{uid}</code>\n"
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=kb)
+
+    elif data == 'admin_list':
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        cursor.execute('SELECT user_id, username, first_name, added_at FROM admins')
+        rows = cursor.fetchall()
+        text = '👑 <b>Список администраторов:</b>\n\n'
+        kb = tb_types.InlineKeyboardMarkup(row_width=1)
+        for uid, uname, fname, added in rows:
+            label = '👑 Суперадмин' if uid == SUPERADMIN_ID else '🛡 Админ'
+            uname_display = f'@{uname}' if uname else 'нет'
+            text += f"{label} <b>{fname}</b> ({uname_display})\n🆔 <code>{uid}</code>\n\n"
+            if uid != SUPERADMIN_ID and is_superadmin(user_id):
+                kb.add(tb_types.InlineKeyboardButton(f'❌ Снять {fname}', callback_data=f'removeadmin_{uid}'))
+        if is_superadmin(user_id):
+            kb.add(tb_types.InlineKeyboardButton('➕ Добавить админа по ID', callback_data='add_admin_prompt'))
+        kb.add(tb_types.InlineKeyboardButton('🔙 Назад', callback_data='admin_panel'))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=kb)
+
+    elif data.startswith('approve_'):
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        target_id = int(data.split('_')[1])
+        cursor.execute('UPDATE bot_users SET status=? WHERE user_id=?', ('approved', target_id))
+        conn.commit()
+        bot.answer_callback_query(call.id, '✅ Доступ предоставлен')
+        try:
+            bot.send_message(target_id,
+                             '✅ <b>Ваша заявка одобрена!</b>\nТеперь вы можете пользоваться ботом. Нажмите /start',
+                             parse_mode='HTML')
+        except Exception:
+            pass
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        bot.send_message(call.message.chat.id, f'✅ Пользователь <code>{target_id}</code> одобрен.',
+                         parse_mode='HTML')
+
+    elif data.startswith('ban_'):
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        target_id = int(data.split('_')[1])
+        cursor.execute('UPDATE bot_users SET status=? WHERE user_id=?', ('banned', target_id))
+        conn.commit()
+        bot.answer_callback_query(call.id, '🚫 Доступ запрещён')
+        try:
+            bot.send_message(target_id, '🚫 Ваша заявка отклонена администратором.', parse_mode='HTML')
+        except Exception:
+            pass
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        bot.send_message(call.message.chat.id, f'🚫 Пользователь <code>{target_id}</code> заблокирован.',
+                         parse_mode='HTML')
+
+    elif data.startswith('unban_'):
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        target_id = int(data.split('_')[1])
+        cursor.execute('UPDATE bot_users SET status=? WHERE user_id=?', ('pending', target_id))
+        conn.commit()
+        bot.answer_callback_query(call.id, '♻️ Разблокирован')
+        bot.send_message(call.message.chat.id, f'♻️ Пользователь <code>{target_id}</code> разблокирован.',
+                         parse_mode='HTML')
+
+    elif data.startswith('removeadmin_'):
+        if not is_superadmin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Только суперадмин')
+            return
+        target_id = int(data.split('_')[1])
+        cursor.execute('DELETE FROM admins WHERE user_id=?', (target_id,))
+        conn.commit()
+        bot.answer_callback_query(call.id, '❌ Админ снят')
+        bot.send_message(call.message.chat.id, f'❌ Пользователь <code>{target_id}</code> снят с должности админа.',
+                         parse_mode='HTML')
+
+    elif data == 'add_admin_prompt':
+        if not is_superadmin(user_id):
+            bot.answer_callback_query(call.id, '⛔ Только суперадмин')
+            return
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id,
+                               '✏️ Введите Telegram ID пользователя которого хотите сделать админом:')
+        bot.register_next_step_handler(msg, process_add_admin)
+
+    elif data == 'my_commands':
+        if not is_approved(user_id):
+            bot.answer_callback_query(call.id, '⛔ Нет доступа')
+            return
+        text = build_help_text(user_id)
+        kb = tb_types.InlineKeyboardMarkup()
+        kb.add(tb_types.InlineKeyboardButton('🔙 Назад', callback_data='back_start'))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode='HTML', reply_markup=kb)
+
+    elif data == 'about':
+        kb = tb_types.InlineKeyboardMarkup()
+        kb.add(tb_types.InlineKeyboardButton('🔙 Назад', callback_data='back_start'))
+        bot.edit_message_text(
+            '🤖 <b>UserBot</b>\n\nУмный юзербот с расширенным функционалом.\n\n'
+            '⚡ Отслеживание удалений и редактирований\n'
+            '🔔 Напоминания\n'
+            '😴 AFK режим\n'
+            '🎲 Случайные факты\n'
+            '🔢 Калькулятор\n'
+            '🎭 И многое другое',
+            call.message.chat.id, call.message.message_id,
+            parse_mode='HTML', reply_markup=kb
+        )
+
+    bot.answer_callback_query(call.id)
+
+
+def process_add_admin(message):
+    if not is_superadmin(message.from_user.id):
+        return
+    try:
+        target_id = int(message.text.strip())
+        # Проверяем что уже не админ
+        if is_admin(target_id):
+            bot.send_message(message.chat.id, f'ℹ️ Пользователь <code>{target_id}</code> уже является админом.',
+                             parse_mode='HTML')
+            return
+        # Получаем данные из bot_users если есть
+        row = cursor.execute('SELECT username, first_name FROM bot_users WHERE user_id=?', (target_id,)).fetchone()
+        username = row[0] if row else ''
+        first_name = row[1] if row else str(target_id)
+        cursor.execute('INSERT OR REPLACE INTO admins (user_id, username, first_name, added_at) VALUES (?, ?, ?, ?)',
+                       (target_id, username, first_name, datetime.now().isoformat()))
+        conn.commit()
+        bot.send_message(message.chat.id, f'✅ Пользователь <code>{target_id}</code> назначен администратором.',
+                         parse_mode='HTML')
+        try:
+            bot.send_message(target_id,
+                             '🛡 Вы назначены <b>администратором</b> бота!\nНажмите /start для доступа к панели.',
+                             parse_mode='HTML')
+        except Exception:
+            pass
+    except ValueError:
+        bot.send_message(message.chat.id, '❌ Неверный формат ID. Введите числовой Telegram ID.')
+
+
+# === КОМАНДЫ БОТА ДЛЯ РАЗРЕШЁННЫХ ПОЛЬЗОВАТЕЛЕЙ ===
+
+@bot.message_handler(commands=['remind'])
+def remind_handler(message):
+    if not is_approved(message.from_user.id):
+        bot.reply_to(message, '⛔ У вас нет доступа.')
+        return
+    # Формат: /remind 10m текст напоминания
+    try:
+        parts = message.text.split(' ', 2)
+        if len(parts) < 3:
+            bot.reply_to(message, '💬 Использование: /remind 10m текст\nФорматы времени: 10m, 2h, 1d')
+            return
+        time_str = parts[1].lower()
+        text = parts[2]
+
+        if time_str.endswith('m'):
+            delta = timedelta(minutes=int(time_str[:-1]))
+        elif time_str.endswith('h'):
+            delta = timedelta(hours=int(time_str[:-1]))
+        elif time_str.endswith('d'):
+            delta = timedelta(days=int(time_str[:-1]))
+        else:
+            bot.reply_to(message, '❌ Неверный формат времени. Используйте: 10m, 2h, 1d')
+            return
+
+        remind_at = (datetime.now() + delta).isoformat()
+        cursor.execute('INSERT INTO reminders (user_id, text, remind_at) VALUES (?, ?, ?)',
+                       (message.from_user.id, text, remind_at))
+        conn.commit()
+
+        time_label = str(time_str)
+        bot.reply_to(message, f'⏰ Напоминание установлено через <b>{time_label}</b>!\n\n<blockquote>{text}</blockquote>',
+                     parse_mode='HTML')
+    except Exception as e:
+        bot.reply_to(message, f'❌ Ошибка: {e}')
+
+
+@bot.message_handler(commands=['myreminders'])
+def my_reminders_handler(message):
+    if not is_approved(message.from_user.id):
+        bot.reply_to(message, '⛔ У вас нет доступа.')
+        return
+    cursor.execute('SELECT id, text, remind_at FROM reminders WHERE user_id=? ORDER BY remind_at', (message.from_user.id,))
+    rows = cursor.fetchall()
+    if not rows:
+        bot.reply_to(message, '📭 У вас нет активных напоминаний.')
+        return
+    text = '⏰ <b>Ваши напоминания:</b>\n\n'
+    for rid, rtext, rat in rows:
+        try:
+            dt = datetime.fromisoformat(rat).strftime('%d.%m.%Y %H:%M')
+        except Exception:
+            dt = rat
+        text += f"🔔 <code>#{rid}</code> — {dt}\n<blockquote>{rtext}</blockquote>\n\n"
+    bot.reply_to(message, text, parse_mode='HTML')
+
+
+@bot.message_handler(commands=['calc'])
+def calc_handler(message):
+    if not is_approved(message.from_user.id):
+        bot.reply_to(message, '⛔ У вас нет доступа.')
+        return
+    try:
+        expr = message.text[6:].strip()
+        if not expr:
+            bot.reply_to(message, '💬 Использование: /calc 2+2*3')
+            return
+        # Безопасный eval — только цифры и операторы
+        allowed = set('0123456789+-*/()., ')
+        if not all(c in allowed for c in expr):
+            bot.reply_to(message, '❌ Недопустимые символы в выражении.')
+            return
+        result = eval(expr)
+        bot.reply_to(message, f'🔢 <code>{expr}</code> = <b>{result}</b>', parse_mode='HTML')
+    except Exception:
+        bot.reply_to(message, '❌ Ошибка вычисления.')
+
+
+@bot.message_handler(commands=['fact'])
+def fact_handler(message):
+    if not is_approved(message.from_user.id):
+        bot.reply_to(message, '⛔ У вас нет доступа.')
+        return
+    facts = [
+        '🧠 Осьминоги имеют три сердца и голубую кровь.',
+        '🌍 На Земле больше деревьев, чем звёзд в Млечном пути.',
+        '⚡ Молния бьёт в Землю около 100 раз в секунду.',
+        '🐬 Дельфины спят с одним открытым глазом.',
+        '🍯 Мёд никогда не портится — его находили в египетских гробницах.',
+        '🦋 Бабочки пробуют вкус еды ногами.',
+        '🌙 На Луне нет ветра, поэтому следы астронавтов сохранятся тысячи лет.',
+        '🐘 Слоны — единственные животные, которые не могут прыгать.',
+        '🦈 Акулы старше деревьев — они появились 400 млн лет назад.',
+        '🔬 В теле человека больше бактерий, чем клеток.',
+        '🌊 95% океанов до сих пор не исследованы.',
+        '🧬 ДНК человека на 98.7% совпадает с ДНК шимпанзе.',
+        '🐙 У осьминога нет костей, он может пролезть в любое отверстие размером с его клюв.',
+        '🌡 Самая высокая температура во вселенной была достигнута в Большом адронном коллайдере.',
+        '🦜 Попугаи — единственные птицы, которые едят лапами.',
+    ]
+    bot.reply_to(message, random.choice(facts), parse_mode='HTML')
+
+
+@bot.message_handler(commands=['coin'])
+def coin_handler(message):
+    if not is_approved(message.from_user.id):
+        bot.reply_to(message, '⛔ У вас нет доступа.')
+        return
+    result = random.choice(['🪙 Орёл', '🪙 Решка'])
+    bot.reply_to(message, f'Монетка: <b>{result}</b>', parse_mode='HTML')
+
+
+@bot.message_handler(commands=['dice'])
+def dice_handler(message):
+    if not is_approved(message.from_user.id):
+        bot.reply_to(message, '⛔ У вас нет доступа.')
+        return
+    parts = message.text.split()
+    sides = 6
+    if len(parts) > 1:
+        try:
+            sides = min(int(parts[1]), 100)
+        except ValueError:
+            pass
+    result = random.randint(1, sides)
+    bot.reply_to(message, f'🎲 Бросок кубика d{sides}: <b>{result}</b>', parse_mode='HTML')
+
+
+@bot.message_handler(commands=['id'])
+def id_handler(message):
+    if not is_approved(message.from_user.id):
+        bot.reply_to(message, '⛔ У вас нет доступа.')
+        return
+    uid = message.from_user.id
+    uname = f'@{message.from_user.username}' if message.from_user.username else 'нет'
+    fname = message.from_user.first_name or ''
+    text = (
+        f'<blockquote>👤 Ваши данные:\n'
+        f'├ 🆔 ID: <code>{uid}</code>\n'
+        f'├ ✈️ Username: <b>{uname}</b>\n'
+        f'└ 📛 Имя: <b>{fname}</b></blockquote>'
+    )
+    bot.reply_to(message, text, parse_mode='HTML')
+
+
+@bot.message_handler(commands=['help'])
+def help_bot_handler(message):
+    if not is_approved(message.from_user.id):
+        bot.reply_to(message, '⛔ У вас нет доступа. Отправьте /start для подачи заявки.')
+        return
+    text = build_help_text(message.from_user.id)
+    bot.reply_to(message, text, parse_mode='HTML')
+
+
+def build_help_text(user_id: int) -> str:
+    text = '<b>📋 Доступные команды бота:</b>\n\n'
+    text += (
+        '<blockquote>'
+        '⏰ /remind 10m текст — напоминание\n'
+        '📋 /myreminders — мои напоминания\n'
+        '🔢 /calc 2+2 — калькулятор\n'
+        '🧠 /fact — случайный факт\n'
+        '🪙 /coin — подбросить монетку\n'
+        '🎲 /dice [стороны] — бросить кубик\n'
+        '🆔 /id — ваш Telegram ID\n'
+        '❓ /help — эта справка\n'
+        '</blockquote>'
+    )
+    if is_admin(user_id):
+        text += (
+            '\n<b>🛡 Команды администратора:</b>\n\n'
+            '<blockquote>'
+            '/addadmin [ID] — добавить админа\n'
+            '/removeadmin [ID] — снять админа\n'
+            '/users — список всех пользователей\n'
+            '/broadcast текст — рассылка всем\n'
+            '</blockquote>'
+        )
+    return text
+
+
+@bot.message_handler(commands=['addadmin'])
+def addadmin_bot_handler(message):
+    if not is_superadmin(message.from_user.id):
+        bot.reply_to(message, '⛔ Только суперадмин.')
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, '💬 Использование: /addadmin [ID]')
+        return
+    try:
+        target_id = int(parts[1])
+        if is_admin(target_id):
+            bot.reply_to(message, 'ℹ️ Уже является админом.')
+            return
+        row = cursor.execute('SELECT username, first_name FROM bot_users WHERE user_id=?', (target_id,)).fetchone()
+        username = row[0] if row else ''
+        first_name = row[1] if row else str(target_id)
+        cursor.execute('INSERT OR REPLACE INTO admins (user_id, username, first_name, added_at) VALUES (?, ?, ?, ?)',
+                       (target_id, username, first_name, datetime.now().isoformat()))
+        conn.commit()
+        bot.reply_to(message, f'✅ <code>{target_id}</code> назначен администратором.', parse_mode='HTML')
+        try:
+            bot.send_message(target_id, '🛡 Вы назначены <b>администратором</b> бота! Нажмите /start',
+                             parse_mode='HTML')
+        except Exception:
+            pass
+    except ValueError:
+        bot.reply_to(message, '❌ Неверный ID.')
+
+
+@bot.message_handler(commands=['removeadmin'])
+def removeadmin_bot_handler(message):
+    if not is_superadmin(message.from_user.id):
+        bot.reply_to(message, '⛔ Только суперадмин.')
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, '💬 Использование: /removeadmin [ID]')
+        return
+    try:
+        target_id = int(parts[1])
+        if target_id == SUPERADMIN_ID:
+            bot.reply_to(message, '⛔ Нельзя снять суперадмина.')
+            return
+        cursor.execute('DELETE FROM admins WHERE user_id=?', (target_id,))
+        conn.commit()
+        bot.reply_to(message, f'❌ <code>{target_id}</code> снят с должности.', parse_mode='HTML')
+    except ValueError:
+        bot.reply_to(message, '❌ Неверный ID.')
+
+
+@bot.message_handler(commands=['users'])
+def users_handler(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, '⛔ Нет доступа.')
+        return
+    cursor.execute('SELECT user_id, username, first_name, status FROM bot_users')
+    rows = cursor.fetchall()
+    if not rows:
+        bot.reply_to(message, '📭 Нет пользователей.')
+        return
+    text = '👥 <b>Все пользователи:</b>\n\n'
+    status_icons = {'approved': '✅', 'pending': '⏳', 'banned': '🚫'}
+    for uid, uname, fname, status in rows:
+        icon = status_icons.get(status, '❓')
+        uname_display = f'@{uname}' if uname else 'нет'
+        text += f"{icon} <b>{fname}</b> ({uname_display}) — <code>{uid}</code>\n"
+    bot.reply_to(message, text, parse_mode='HTML')
+
+
+@bot.message_handler(commands=['broadcast'])
+def broadcast_handler(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, '⛔ Нет доступа.')
+        return
+    text = message.text[11:].strip()
+    if not text:
+        bot.reply_to(message, '💬 Использование: /broadcast текст сообщения')
+        return
+    cursor.execute('SELECT user_id FROM bot_users WHERE status=?', ('approved',))
+    rows = cursor.fetchall()
+    sent = 0
+    for (uid,) in rows:
+        try:
+            bot.send_message(uid, f'📢 <b>Сообщение от администратора:</b>\n\n{text}', parse_mode='HTML')
+            sent += 1
+        except Exception:
+            pass
+    bot.reply_to(message, f'✅ Рассылка отправлена {sent} пользователям.')
+
+
+# =====================================================
+# === USERBOT КОМАНДЫ (через Telethon) ===
+# =====================================================
 
 async def deleted_handler(event):
-    """
-    .deleted [N] — показывает последние N удалённых сообщений (по умолчанию 5, макс 20).
-    """
     if not await check_is_owner(event):
         return
     try:
@@ -371,14 +1065,8 @@ async def deleted_handler(event):
 
             media_label = ""
             if media_type:
-                labels = {
-                    'photo': '🖼 Фото',
-                    'video': '🎬 Видео',
-                    'voice': '🎤 Голосовое',
-                    'audio': '🎵 Аудио',
-                    'sticker': '🎭 Стикер',
-                    'document': '📎 Документ',
-                }
+                labels = {'photo': '🖼 Фото', 'video': '🎬 Видео', 'voice': '🎤 Голосовое',
+                          'audio': '🎵 Аудио', 'sticker': '🎭 Стикер', 'document': '📎 Документ'}
                 media_label = f"\n{labels.get(media_type, '📎 Медиа')}"
 
             caption = (
@@ -394,62 +1082,6 @@ async def deleted_handler(event):
         print(f"Deleted handler error: {e}")
         await event.edit('❌ Ошибка при получении удалённых сообщений.')
 
-
-# === ОБРАБОТКА РЕДАКТИРОВАНИЙ ===
-
-async def process_edited_message(event):
-    if event.message.out:
-        return
-    try:
-        peer = event.message.peer_id
-        chat_id = get_peer_id(peer)
-        if not chat_id:
-            return
-
-        cursor.execute(
-            'SELECT text FROM messages WHERE msg_id=? AND chat_id=?',
-            (event.message.id, chat_id)
-        )
-        row = cursor.fetchone()
-        if not row:
-            return
-
-        old_text = row[0]
-        new_text = event.message.text or event.message.message or ""
-        if new_text == old_text:
-            return
-
-        user_id = event.message.sender_id
-        if not user_id or user_id == owner_id:
-            return
-
-        username, name, _ = await get_user_info(user_id)
-        link = f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
-
-        if chat_id != user_id:
-            chat_title = await get_chat_title(chat_id)
-            source = f" в <b>{chat_title}</b>"
-        else:
-            source = ""
-
-        message_text = (
-            f"🔏 <a href=\"{link}\">{name}</a> изменил сообщение{source}.\n\n"
-            f"Старый текст:\n<blockquote>{old_text}</blockquote>\n"
-            f"Новый текст:\n<blockquote>{new_text}</blockquote>"
-        )
-        await send_bot_message(message_text)
-
-        cursor.execute(
-            'UPDATE messages SET text=? WHERE msg_id=? AND chat_id=?',
-            (new_text, event.message.id, chat_id)
-        )
-        conn.commit()
-        stored_messages[(chat_id, event.message.id)] = new_text
-    except Exception as e:
-        print(f"Edit error: {e}")
-
-
-# === ОСТАЛЬНЫЕ КОМАНДЫ ===
 
 async def mute_handler(event):
     global muted_users
@@ -498,14 +1130,27 @@ async def unmute_handler(event):
 
 
 async def incoming_message_handler(event):
-    """Сохраняет все входящие сообщения (личка + группы)."""
     try:
         peer = event.message.peer_id
         sender_id = event.message.sender_id
         if not sender_id:
             return
 
-        # Удаляем сообщения от замьюченных (только в личке)
+        # AFK ответ
+        if owner_id and sender_id != owner_id:
+            cursor.execute('SELECT reason, since FROM afk WHERE user_id=?', (owner_id,))
+            afk_row = cursor.fetchone()
+            if afk_row:
+                reason, since = afk_row
+                try:
+                    since_dt = datetime.fromisoformat(since).strftime('%H:%M')
+                except Exception:
+                    since_dt = since
+                afk_text = f'😴 Я сейчас AFK (с {since_dt})'
+                if reason:
+                    afk_text += f'\nПричина: {reason}'
+                await event.reply(afk_text)
+
         if isinstance(peer, PeerUser):
             cursor.execute('SELECT user_id FROM muted_users WHERE user_id=?', (sender_id,))
             if cursor.fetchone():
@@ -519,8 +1164,11 @@ async def incoming_message_handler(event):
 
 
 async def outgoing_message_handler(event):
-    """Сохраняет исходящие сообщения для отслеживания редактирований."""
     try:
+        # Если владелец написал — снимаем AFK
+        if owner_id and event.message.sender_id == owner_id:
+            cursor.execute('DELETE FROM afk WHERE user_id=?', (owner_id,))
+            conn.commit()
         await store_message(event.message)
     except Exception as e:
         print(f"Outgoing message handler error: {e}")
@@ -605,16 +1253,92 @@ async def info_handler(event):
         await event.edit('Ответьте на сообщение!')
 
 
-HELP_TEXT = """<b>📝 Команды</b>
+async def afk_handler(event):
+    if not await check_is_owner(event):
+        return
+    try:
+        parts = event.message.text.split(' ', 1)
+        reason = parts[1].strip() if len(parts) > 1 else ''
+        cursor.execute('INSERT OR REPLACE INTO afk (user_id, reason, since) VALUES (?, ?, ?)',
+                       (owner_id, reason, datetime.now().isoformat()))
+        conn.commit()
+        msg = '😴 AFK режим включён.'
+        if reason:
+            msg += f'\nПричина: {reason}'
+        await event.edit(msg)
+    except Exception as e:
+        print(f"AFK error: {e}")
 
-<blockquote>▫️ Help: ( .help ) — Справка
-▫️ Mute: ( .mute | .unmute ) — Помолчи
-▫️ Spam: ( .spam ) — Спам
-▫️ Typer: ( .type ) — Набор текста
-▫️ UserInfo: ( .info ) — Инфо о пользователе
-▫️ Deleted: ( .deleted [N] ) — Последние N удалённых сообщений</blockquote>
 
-Справка по команде: <code>.help [команда]</code>"""
+async def unafk_handler(event):
+    if not await check_is_owner(event):
+        return
+    try:
+        cursor.execute('DELETE FROM afk WHERE user_id=?', (owner_id,))
+        conn.commit()
+        await event.edit('✅ AFK режим выключен.')
+    except Exception as e:
+        print(f"UnAFK error: {e}")
+
+
+async def ping_handler(event):
+    if not await check_is_owner(event):
+        return
+    start = datetime.now()
+    await event.edit('🏓 Pong!')
+    delta = (datetime.now() - start).microseconds // 1000
+    await event.edit(f'🏓 Pong! <code>{delta}ms</code>', parse_mode='HTML')
+
+
+async def stats_handler(event):
+    if not await check_is_owner(event):
+        return
+    try:
+        total_msgs = cursor.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
+        total_deleted = cursor.execute('SELECT COUNT(*) FROM deleted_messages').fetchone()[0]
+        total_muted = cursor.execute('SELECT COUNT(*) FROM muted_users').fetchone()[0]
+        total_users = cursor.execute('SELECT COUNT(*) FROM bot_users').fetchone()[0]
+        total_admins = cursor.execute('SELECT COUNT(*) FROM admins').fetchone()[0]
+
+        text = (
+            f"<blockquote>📊 Статистика UserBot\n\n"
+            f"├ 💬 Сообщений в БД: <b>{total_msgs}</b>\n"
+            f"├ 🗑 Удалённых: <b>{total_deleted}</b>\n"
+            f"├ 🔕 Замьючено: <b>{total_muted}</b>\n"
+            f"├ 👥 Пользователей бота: <b>{total_users}</b>\n"
+            f"└ 🛡 Администраторов: <b>{total_admins}</b></blockquote>"
+        )
+        await event.edit(text, parse_mode='HTML')
+    except Exception as e:
+        print(f"Stats error: {e}")
+        await event.edit('❌ Ошибка получения статистики.')
+
+
+async def clear_deleted_handler(event):
+    """Очищает базу удалённых сообщений."""
+    if not await check_is_owner(event):
+        return
+    try:
+        cursor.execute('DELETE FROM deleted_messages')
+        conn.commit()
+        await event.edit('🧹 База удалённых сообщений очищена.')
+    except Exception as e:
+        print(f"Clear deleted error: {e}")
+
+
+HELP_TEXT = """<b>📝 Команды UserBot</b>
+
+<blockquote>▫️ .help — Справка
+▫️ .mute / .unmute — Замьютить пользователя
+▫️ .spam [N] [текст] — Спам
+▫️ .type [текст] — Анимация печати
+▫️ .info — Инфо о пользователе
+▫️ .deleted [N] — Последние N удалённых
+▫️ .afk [причина] — Включить AFK режим
+▫️ .unafk — Выключить AFK режим
+▫️ .ping — Проверить задержку
+▫️ .stats — Статистика бота
+▫️ .clear — Очистить базу удалённых</blockquote>"""
 
 
 async def help_handler(event):
@@ -623,30 +1347,41 @@ async def help_handler(event):
     args = event.message.text.split(' ', 1)
     if len(args) > 1:
         command = args[1].strip()
-        if command == 'type':
-            await event.edit('⚙️ Typer\n\n· .type [текст] — Анимация печати текста')
-        elif command == 'spam':
-            await event.edit('⚙️ Spam\n\n· .spam [кол-во] [текст или реплай] — Спам сообщений (макс 20)')
-        elif command == 'mute':
-            await event.edit(
-                '⚙️ Mute\n\n'
-                '· .mute — Заглушить пользователя (в ответ на сообщение)\n'
-                '· .unmute — Разглушить пользователя (в ответ на сообщение)'
-            )
-        elif command == 'info':
-            await event.edit('⚙️ UserInfo\n\n· .info — Информация о пользователе (в ответ на сообщение)')
-        elif command == 'deleted':
-            await event.edit(
-                '⚙️ Deleted\n\n'
-                '· .deleted — Показать последние 5 удалённых сообщений\n'
-                '· .deleted [N] — Показать последние N (макс 20)\n\n'
-                'Сохраняются: текст, фото, видео, голосовые, документы, стикеры.\n'
-                'Работает в личных диалогах и группах.'
-            )
-        else:
-            await event.edit(HELP_TEXT, parse_mode='HTML')
+        helps = {
+            'type': '⚙️ Typer\n\n· .type [текст] — Анимация печати текста',
+            'spam': '⚙️ Spam\n\n· .spam [кол-во] [текст или реплай] — Спам (макс 20)',
+            'mute': '⚙️ Mute\n\n· .mute — Замьютить (реплай)\n· .unmute — Размьютить (реплай)',
+            'info': '⚙️ UserInfo\n\n· .info — Информация (реплай)',
+            'deleted': '⚙️ Deleted\n\n· .deleted [N] — Последние N удалённых (макс 20)',
+            'afk': '⚙️ AFK\n\n· .afk [причина] — Включить AFK\n· .unafk — Выключить AFK',
+            'stats': '⚙️ Stats\n\n· .stats — Статистика бота',
+        }
+        await event.edit(helps.get(command, HELP_TEXT), parse_mode='HTML')
     else:
         await event.edit(HELP_TEXT, parse_mode='HTML')
+
+
+# === ФОНОВЫЕ ЗАДАЧИ ===
+
+async def reminder_checker():
+    """Проверяет и отправляет напоминания."""
+    while True:
+        try:
+            now = datetime.now().isoformat()
+            cursor.execute('SELECT id, user_id, text FROM reminders WHERE remind_at <= ?', (now,))
+            rows = cursor.fetchall()
+            for rid, uid, text in rows:
+                try:
+                    bot.send_message(uid, f'🔔 <b>Напоминание!</b>\n\n<blockquote>{text}</blockquote>',
+                                     parse_mode='HTML')
+                except Exception as e:
+                    print(f"Reminder send error: {e}")
+                cursor.execute('DELETE FROM reminders WHERE id=?', (rid,))
+            if rows:
+                conn.commit()
+        except Exception as e:
+            print(f"Reminder checker error: {e}")
+        await asyncio.sleep(30)
 
 
 # === ЗАГРУЗКА / СЛУЖЕБНОЕ ===
@@ -669,26 +1404,26 @@ def run_bot():
 
 
 def register_handlers(c):
-    # Удаления — единый обработчик для личных и групповых чатов
     c.add_event_handler(raw_deleted_handler, events.Raw(types.UpdateDeleteMessages))
     c.add_event_handler(raw_deleted_handler, events.Raw(types.UpdateDeleteChannelMessages))
 
-    # Мьют
     c.add_event_handler(mute_handler, events.NewMessage(outgoing=True, pattern=r'^\.mute$'))
     c.add_event_handler(unmute_handler, events.NewMessage(outgoing=True, pattern=r'^\.unmute$'))
 
-    # Входящие и исходящие — сохранение
     c.add_event_handler(incoming_message_handler, events.NewMessage(incoming=True))
     c.add_event_handler(outgoing_message_handler, events.NewMessage(outgoing=True))
 
-    # Команды
     c.add_event_handler(type_handler, events.NewMessage(outgoing=True, pattern=r'^\.type '))
     c.add_event_handler(spam_handler, events.NewMessage(outgoing=True, pattern=r'^\.spam '))
     c.add_event_handler(info_handler, events.NewMessage(outgoing=True, pattern=r'^\.info$'))
     c.add_event_handler(deleted_handler, events.NewMessage(outgoing=True, pattern=r'^\.deleted( \d+)?$'))
     c.add_event_handler(help_handler, events.NewMessage(outgoing=True, pattern=r'^\.help( .*)?$'))
+    c.add_event_handler(afk_handler, events.NewMessage(outgoing=True, pattern=r'^\.afk( .*)?$'))
+    c.add_event_handler(unafk_handler, events.NewMessage(outgoing=True, pattern=r'^\.unafk$'))
+    c.add_event_handler(ping_handler, events.NewMessage(outgoing=True, pattern=r'^\.ping$'))
+    c.add_event_handler(stats_handler, events.NewMessage(outgoing=True, pattern=r'^\.stats$'))
+    c.add_event_handler(clear_deleted_handler, events.NewMessage(outgoing=True, pattern=r'^\.clear$'))
 
-    # Редактирования
     c.add_event_handler(handler_message_edited, events.MessageEdited)
 
 
@@ -704,8 +1439,13 @@ async def main():
     print(f"UB started! User ID: {owner_id}")
     print(f"Muted users loaded: {len(muted_users)}")
     print(f"Media saved to: {os.path.abspath(MEDIA_DIR)}")
+    print(f"SuperAdmin: {SUPERADMIN_ID}")
 
     Thread(target=run_bot, daemon=True).start()
+
+    # Запускаем фоновую задачу напоминаний
+    asyncio.create_task(reminder_checker())
+
     await client.run_until_disconnected()
 
 
