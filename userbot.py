@@ -1,8 +1,16 @@
 import asyncio
+import ast
+import html
+import io
 import sqlite3
 import os
 import json
+import math
 import random
+import re
+import tempfile
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 from threading import Thread
 
@@ -13,6 +21,8 @@ from telethon.tl import types
 from telethon.tl.types import PeerUser, PeerChat, PeerChannel, MessageMediaPhoto, MessageMediaDocument
 import telebot
 from telebot import types as tb_types
+import qrcode
+from PIL import Image, ImageFilter, ImageOps, ExifTags
 
 # === СЕКРЕТЫ ===
 load_dotenv()
@@ -1135,45 +1145,33 @@ async def unmute_handler(event):
 
 async def incoming_message_handler(event):
     try:
-        peer = event.message.peer_id
         sender_id = event.message.sender_id
-        if not sender_id:
+        if not sender_id or not owner_id or sender_id == owner_id:
             return
 
-        # AFK ответ
-        if owner_id and sender_id != owner_id:
-            cursor.execute('SELECT reason, since FROM afk WHERE user_id=?', (owner_id,))
-            afk_row = cursor.fetchone()
-            if afk_row:
-                reason, since = afk_row
-                try:
-                    since_dt = datetime.fromisoformat(since).strftime('%H:%M')
-                except Exception:
-                    since_dt = since
-                afk_text = f'😴 Я сейчас AFK (с {since_dt})'
-                if reason:
-                    afk_text += f'\nПричина: {reason}'
-                await event.reply(afk_text)
+        cursor.execute('SELECT reason, since FROM afk WHERE user_id=?', (owner_id,))
+        afk_row = cursor.fetchone()
+        if not afk_row or not isinstance(event.message.peer_id, PeerUser):
+            return
 
-        if isinstance(peer, PeerUser):
-            cursor.execute('SELECT user_id FROM muted_users WHERE user_id=?', (sender_id,))
-            if cursor.fetchone():
-                await event.delete()
-                print(f"Deleted message from muted user {sender_id}")
-                return
-
-        await store_message(event.message)
+        reason, since = afk_row
+        try:
+            since_dt = datetime.fromisoformat(since).strftime('%H:%M')
+        except Exception:
+            since_dt = since
+        afk_text = f'😴 Сейчас AFK (с {since_dt})'
+        if reason:
+            afk_text += f'\nПричина: {reason}'
+        await event.reply(afk_text)
     except Exception as e:
         print(f"Incoming message handler error: {e}")
 
 
 async def outgoing_message_handler(event):
     try:
-        # Если владелец написал — снимаем AFK
         if owner_id and event.message.sender_id == owner_id:
             cursor.execute('DELETE FROM afk WHERE user_id=?', (owner_id,))
             conn.commit()
-        await store_message(event.message)
     except Exception as e:
         print(f"Outgoing message handler error: {e}")
 
@@ -1669,47 +1667,491 @@ def handle_ttt_callback(call):
     bot.answer_callback_query(call.id)
 
 
-HELP_TEXT = """<b>📝 Команды UserBot</b>
+def text_command(event, transform, usage):
+    argument = event.message.text.partition(' ')[2].strip()
+    if not argument:
+        return event.edit(f'Использование: {usage}')
+    return event.edit(transform(argument[:1500]))
 
-<blockquote>▫️ .help — Справка
-▫️ .mute / .unmute — Замьютить пользователя
-▫️ .spam [N] [текст] — Спам
-▫️ .type [текст] — Анимация печати
-▫️ .info — Инфо о пользователе
-▫️ .deleted [N] — Последние N удалённых
-▫️ .afk [причина] — Включить AFK режим
-▫️ .unafk — Выключить AFK режим
-▫️ .ping — Проверить задержку
-▫️ .stats — Статистика бота
-▫️ .clear — Очистить базу удалённых
-▫️ .dox — Фейк досье на пользователя (реплай)
-▫️ .deanon — Фейк деанон (реплай)
-▫️ .fco — Предсказание на день
-▫️ .ttt — Крестики-нолики (реплай)</blockquote>"""
+
+async def roll_handler(event):
+    if not await check_is_owner(event):
+        return
+    try:
+        parts = event.message.text.split()
+        low, high = (1, 100) if len(parts) == 1 else (int(parts[1]), int(parts[2]))
+        if len(parts) not in (1, 3) or low > high or high - low > 1_000_000_000:
+            raise ValueError
+        await event.edit(f'🎲 Выпало: {random.randint(low, high)}')
+    except (ValueError, IndexError):
+        await event.edit('Использование: .roll [от] [до], например .roll 1 100')
+
+
+async def ball_handler(event):
+    if not await check_is_owner(event):
+        return
+    answers = [
+        'Бесспорно.', 'Предрешено.', 'Никаких сомнений.', 'Определённо да.',
+        'Можешь быть уверен.', 'Скорее всего.', 'Пока неясно, попробуй снова.',
+        'Спроси позже.', 'Лучше не рассказывать.', 'Сейчас нельзя предсказать.',
+        'Сомнительно.', 'Мой ответ — нет.', 'Даже не думай об этом.',
+        'Знаки говорят «да».', 'Знаки говорят «нет».',
+    ]
+    question = event.message.text.partition(' ')[2].strip()
+    if not question:
+        await event.edit('Задай вопрос: .ball Будет ли сегодня дождь?')
+        return
+    await event.edit(f'🎱 {random.choice(answers)}')
+
+
+async def text_transform_handler(event):
+    if not await check_is_owner(event):
+        return
+    command = event.message.text.split(maxsplit=1)[0][1:]
+    leet = str.maketrans('aAeEiIoOsStTbB', '4A3E1I0O5S7T8B')
+    dumb_replacements = {'ться': 'ццо', 'тся': 'цца', 'что': 'што', 'ч': '4', 'ш': 'щ', 'ё': 'е'}
+
+    def to_dumb(text):
+        result = text.lower()
+        for source, target in dumb_replacements.items():
+            result = result.replace(source, target)
+        return result.replace('ого', 'аго').replace('жи', 'жы').replace('ши', 'шы')
+
+    if command == 'leet':
+        await text_command(event, lambda text: text.translate(leet), '.leet текст')
+    else:
+        await text_command(event, to_dumb, '.dumb текст')
+
+
+MORSE = {
+    'а': '.-', 'б': '-...', 'в': '.--', 'г': '--.', 'д': '-..', 'е': '.',
+    'ё': '.', 'ж': '...-', 'з': '--..', 'и': '..', 'й': '.---', 'к': '-.-',
+    'л': '.-..', 'м': '--', 'н': '-.', 'о': '---', 'п': '.--.', 'р': '.-.',
+    'с': '...', 'т': '-', 'у': '..-', 'ф': '..-.', 'х': '....', 'ц': '-.-.',
+    'ч': '---.', 'ш': '----', 'щ': '--.-', 'ъ': '--.--', 'ы': '-.--',
+    'ь': '-..-', 'э': '..-..', 'ю': '..--', 'я': '.-.-',
+    '0': '-----', '1': '.----', '2': '..---', '3': '...--', '4': '....-',
+    '5': '.....', '6': '-....', '7': '--...', '8': '---..', '9': '----.',
+}
+MORSE_REVERSE = {code: char for char, code in MORSE.items()}
+
+
+async def morse_handler(event):
+    if not await check_is_owner(event):
+        return
+    text = event.message.text.partition(' ')[2].strip().lower()
+    if not text:
+        await event.edit('Использование: .morse текст')
+        return
+    words = text.split(' / ')
+    if all(all(code in MORSE_REVERSE for code in word.split()) for word in words):
+        decoded = ' '.join(''.join(MORSE_REVERSE[code] for code in word.split()) for word in words)
+        await event.edit(decoded[:3000])
+        return
+    encoded = ' / '.join(' '.join(MORSE.get(char, char) for char in word) for word in text.split())
+    await event.edit(encoded[:3000])
+
+
+async def rps_handler(event):
+    if not await check_is_owner(event):
+        return
+    parts = event.message.text.lower().split()
+    aliases = {'rock': 'камень', 'scissors': 'ножницы', 'paper': 'бумага'}
+    choices = {'камень': '✊', 'ножницы': '✌️', 'бумага': '✋'}
+    if len(parts) != 2 or parts[1] not in choices:
+        if len(parts) != 2 or parts[1] not in aliases:
+            await event.edit('Использование: .rps камень, .rps ножницы или .rps бумага')
+            return
+    selected = aliases.get(parts[1], parts[1])
+    bot_choice = random.choice(('камень', 'ножницы', 'бумага'))
+    beats = {'камень': 'ножницы', 'ножницы': 'бумага', 'бумага': 'камень'}
+    result = 'Ничья!' if selected == bot_choice else ('Ты выиграл!' if beats[selected] == bot_choice else 'Я выиграл!')
+    await event.edit(f'Ты: {choices[selected]}  Я: {choices[bot_choice]}\n{result}')
+
+
+def safe_calculate(expression):
+    if not expression or len(expression) > 100:
+        raise ValueError('Слишком длинное выражение')
+
+    tree = ast.parse(expression, mode='eval')
+    operations = {
+        ast.Add: lambda left, right: left + right,
+        ast.Sub: lambda left, right: left - right,
+        ast.Mult: lambda left, right: left * right,
+        ast.Div: lambda left, right: left / right,
+        ast.FloorDiv: lambda left, right: left // right,
+        ast.Mod: lambda left, right: left % right,
+        ast.Pow: lambda left, right: left ** right,
+    }
+
+    def evaluate(node):
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            value = node.value
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            operand = evaluate(node.operand)
+            value = operand if isinstance(node.op, ast.UAdd) else -operand
+        elif isinstance(node, ast.BinOp) and type(node.op) in operations:
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError('Слишком большая степень')
+            value = operations[type(node.op)](left, right)
+        else:
+            raise ValueError('Недопустимая операция')
+
+        if not math.isfinite(value) or abs(value) > 1e100:
+            raise ValueError('Результат слишком большой')
+        return value
+
+    return evaluate(tree)
+
+
+async def calc_handler(event):
+    if not await check_is_owner(event):
+        return
+    expression = event.message.text.partition(' ')[2].strip()
+    try:
+        result = safe_calculate(expression)
+        await event.edit(f'🔢 {expression} = {result}')
+    except (ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+        await event.edit('Не удалось вычислить. Поддерживаются числа и +, -, *, /, //, %, **, скобки.')
+
+
+async def coin_handler(event):
+    if not await check_is_owner(event):
+        return
+    await event.edit('🪙 Подбрасываю...')
+    await asyncio.sleep(0.5)
+    await event.edit(f'🪙 Выпало: {random.choice(("орёл", "решка"))}')
+
+
+async def reminder_command_handler(event):
+    if not await check_is_owner(event):
+        return
+    parts = event.message.text.split(maxsplit=2)
+    if len(parts) != 3:
+        await event.edit('Использование: .remind 30m текст напоминания')
+        return
+    match = re.fullmatch(r'([1-9]\d{0,4})(s|m|h|d)', parts[1].lower())
+    if not match:
+        await event.edit('Укажи интервал: например 30m, 2h или 1d.')
+        return
+    amount, unit = int(match.group(1)), match.group(2)
+    factors = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+    seconds = amount * factors[unit]
+    if seconds > 30 * 86400:
+        await event.edit('Максимальный срок напоминания — 30 дней.')
+        return
+    remind_at = (datetime.now() + timedelta(seconds=seconds)).isoformat()
+    cursor.execute('INSERT INTO reminders (user_id, text, remind_at) VALUES (?, ?, ?)',
+                   (owner_id, parts[2][:500], remind_at))
+    conn.commit()
+    reminder_id = cursor.lastrowid
+    await event.edit(f'⏰ Напоминание #{reminder_id} установлено через {parts[1]}.')
+
+
+async def myreminders_handler(event):
+    if not await check_is_owner(event):
+        return
+    cursor.execute('SELECT id, text, remind_at FROM reminders WHERE user_id=? ORDER BY remind_at LIMIT 20', (owner_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await event.edit('Активных напоминаний нет.')
+        return
+    lines = ['⏰ Напоминания:']
+    for reminder_id, text, remind_at in rows:
+        try:
+            display_time = datetime.fromisoformat(remind_at).strftime('%d.%m %H:%M')
+        except ValueError:
+            display_time = remind_at
+        lines.append(f'#{reminder_id} · {display_time} · {text}')
+    await event.edit('\n'.join(lines))
+
+
+async def cancelremind_handler(event):
+    if not await check_is_owner(event):
+        return
+    parts = event.message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await event.edit('Использование: .cancelremind ID')
+        return
+    cursor.execute('DELETE FROM reminders WHERE id=? AND user_id=?', (int(parts[1]), owner_id))
+    conn.commit()
+    await event.edit('Напоминание отменено.' if cursor.rowcount else 'Напоминание не найдено.')
+
+
+ANIMATIONS = {
+    'love': ('💗', '💖', '💕', '💞', '💗'),
+    'fire': ('🔥', '❤️‍🔥', '🔥🔥', '✨'),
+    'boom': ('💥', '💥💥', '✨'),
+    'magic': ('✨', '🪄', '🌟', '✨'),
+    'matrix': ('▌█▌ 010101', 'ДОСТУП ПОЛУЧЕН', '✅'),
+    'heart': ('♡', '♥', '💗', '♥'),
+    'load': ('[....] 0%', '[#...] 25%', '[##..] 50%', '[###.] 75%', '[####] 100%'),
+    'police': ('🚨', '🔴🚨🔵', '🔵🚨🔴', '🚨'),
+    'clown': ('🙂', '🤡', '🤡🎪'),
+}
+
+
+async def animation_handler(event):
+    if not await check_is_owner(event):
+        return
+    command = event.message.text.split(maxsplit=1)[0][1:]
+    label = event.message.text.partition(' ')[2].strip()[:150]
+    frames = ANIMATIONS[command]
+    for index, frame in enumerate(frames):
+        suffix = f' {label}' if label else ''
+        await event.edit(f'{frame}{suffix}')
+        if index < len(frames) - 1:
+            await asyncio.sleep(1)
+
+
+async def image_effect_handler(event):
+    if not await check_is_owner(event):
+        return
+    command = event.message.text.split(maxsplit=1)[0][1:]
+    reply = await event.get_reply_message()
+    if not reply or not reply.photo:
+        await event.edit(f'Ответь командой .{command} на фотографию.')
+        return
+    if reply.file and reply.file.size and reply.file.size > 15 * 1024 * 1024:
+        await event.edit('Файл больше допустимого лимита 15 МБ.')
+        return
+
+    try:
+        raw_image = await client.download_media(reply, file=bytes)
+        with Image.open(io.BytesIO(raw_image)) as source:
+            image = ImageOps.exif_transpose(source).convert('RGB')
+            if command == 'blur':
+                parts = event.message.text.split()
+                try:
+                    amount = int(parts[1]) if len(parts) > 1 else 50
+                except ValueError:
+                    amount = 50
+                radius = max(1, min(25, amount / 4))
+                image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+            elif command == 'chp':
+                image.thumbnail((640, 640))
+            elif command == 'frame':
+                image = ImageOps.expand(image, border=18, fill=(28, 31, 36))
+
+            output = io.BytesIO()
+            output.name = 'edited.jpg'
+            image.save(output, format='JPEG', quality=8 if command == 'chp' else 90)
+            output.seek(0)
+        await client.send_file(event.chat_id, output, caption=f'Обработка: {command}')
+        await event.delete()
+    except Exception:
+        await event.edit('Не удалось обработать фотографию.')
+
+
+async def geo_handler(event):
+    if not await check_is_owner(event):
+        return
+    place_query = event.message.text.partition(' ')[2].strip()
+    if not place_query:
+        await event.edit('Использование: .geo город или общественное место')
+        return
+    await event.edit('📍 Ищу место...')
+    try:
+        query = urllib.parse.urlencode({'name': place_query[:100], 'count': 1, 'language': 'ru', 'format': 'json'})
+        data = await asyncio.to_thread(fetch_json, f'https://geocoding-api.open-meteo.com/v1/search?{query}')
+        places = data.get('results') or []
+        if not places:
+            await event.edit('Место не найдено.')
+            return
+        place = places[0]
+        latitude, longitude = place['latitude'], place['longitude']
+        map_link = f'https://www.openstreetmap.org/?mlat={latitude}&mlon={longitude}#map=12/{latitude}/{longitude}'
+        await event.edit(f'📍 {place["name"]}, {place.get("country", "")}\n{map_link}')
+    except Exception:
+        await event.edit('Не удалось найти место. Попробуй позже.')
+
+
+async def id_handler(event):
+    if not await check_is_owner(event):
+        return
+    reply = await event.get_reply_message()
+    user_id = reply.sender_id if reply else event.message.sender_id
+    await event.edit(
+        f'🆔 ID чата: {event.chat_id}\n'
+        f'ID сообщения: {reply.id if reply else event.message.id}\n'
+        f'ID пользователя: {user_id or "не определён"}'
+    )
+
+
+async def link_handler(event):
+    if not await check_is_owner(event):
+        return
+    text = event.message.text.partition(' ')[2].strip()
+    me = await client.get_me()
+    if not me.username:
+        await event.edit('Для ссылки нужен публичный username аккаунта.')
+        return
+    link = f'https://t.me/{me.username}'
+    if text:
+        link += f'?text={urllib.parse.quote(text[:500], safe="")}'
+    await event.edit(f'🔗 Ссылка на профиль: {link}')
+
+
+async def qr_handler(event):
+    if not await check_is_owner(event):
+        return
+    value = event.message.text.partition(' ')[2].strip()
+    if not value:
+        await event.edit('Использование: .qr ссылка или текст')
+        return
+    if len(value) > 1500:
+        await event.edit('Слишком длинный текст для QR-кода (максимум 1500 символов).')
+        return
+    image = qrcode.make(value)
+    output = io.BytesIO()
+    output.name = 'qr.png'
+    image.save(output, format='PNG')
+    output.seek(0)
+    await event.delete()
+    await client.send_file(event.chat_id, output, caption='QR-код')
+
+
+def fetch_json(url):
+    request = urllib.request.Request(url, headers={'User-Agent': 'SaveModeUserbot/1.0'})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        return json.loads(response.read(1_000_000))
+
+
+async def iss_handler(event):
+    if not await check_is_owner(event):
+        return
+    await event.edit('🛰 Получаю координаты МКС...')
+    try:
+        data = await asyncio.to_thread(fetch_json, 'https://api.wheretheiss.at/v1/satellites/25544')
+        await event.edit(
+            f'🛰 МКС сейчас над точкой: {data["latitude"]:.3f}, {data["longitude"]:.3f}\n'
+            f'Высота: {data["altitude"]:.1f} км\nСкорость: {data["velocity"]:.0f} км/ч'
+        )
+    except Exception:
+        await event.edit('Сервис координат МКС сейчас недоступен.')
+
+
+async def weather_handler(event):
+    if not await check_is_owner(event):
+        return
+    city = event.message.text.partition(' ')[2].strip()
+    if not city:
+        await event.edit('Использование: .weather Москва')
+        return
+    await event.edit('🌦 Ищу прогноз...')
+    try:
+        query = urllib.parse.urlencode({'name': city[:100], 'count': 1, 'language': 'ru', 'format': 'json'})
+        geo = await asyncio.to_thread(fetch_json, f'https://geocoding-api.open-meteo.com/v1/search?{query}')
+        places = geo.get('results') or []
+        if not places:
+            await event.edit('Город не найден. Проверь название и попробуй снова.')
+            return
+        place = places[0]
+        query = urllib.parse.urlencode({
+            'latitude': place['latitude'], 'longitude': place['longitude'],
+            'current': 'temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m',
+            'daily': 'temperature_2m_max,temperature_2m_min,precipitation_probability_max',
+            'forecast_days': 2, 'timezone': 'auto',
+        })
+        forecast = await asyncio.to_thread(fetch_json, f'https://api.open-meteo.com/v1/forecast?{query}')
+        current = forecast['current']
+        daily = forecast['daily']
+        await event.edit(
+            f'🌦 {place["name"]}, {place.get("country", "")}\n'
+            f'Сейчас: {current["temperature_2m"]}°C, ощущается как {current["apparent_temperature"]}°C\n'
+            f'Влажность: {current["relative_humidity_2m"]}% · ветер {current["wind_speed_10m"]} км/ч\n'
+            f'Завтра: {daily["temperature_2m_min"][1]}…{daily["temperature_2m_max"][1]}°C, '
+            f'вероятность осадков {daily["precipitation_probability_max"][1]}%'
+        )
+    except Exception:
+        await event.edit('Не удалось получить прогноз. Попробуй позже или уточни название города.')
+
+
+async def exif_handler(event):
+    if not await check_is_owner(event):
+        return
+    reply = await event.get_reply_message()
+    if not reply or not reply.photo:
+        await event.edit('Ответь командой .spinf на фотографию.')
+        return
+    if reply.file and reply.file.size and reply.file.size > 15 * 1024 * 1024:
+        await event.edit('Файл больше допустимого лимита 15 МБ.')
+        return
+
+    path = None
+    try:
+        handle = tempfile.NamedTemporaryFile(suffix='.img', delete=False)
+        path = handle.name
+        handle.close()
+        await client.download_media(reply, file=path)
+        with Image.open(path) as image:
+            raw_exif = image.getexif()
+            labels = {ExifTags.TAGS.get(key, str(key)): value for key, value in raw_exif.items()}
+            safe_fields = ('Make', 'Model', 'DateTime', 'Software', 'Orientation', 'ExposureTime', 'FNumber', 'ISOSpeedRatings', 'FocalLength')
+            details = [f'{label}: {labels[label]}' for label in safe_fields if label in labels]
+            details.insert(0, f'Размер: {image.width}×{image.height}')
+        await event.edit('📷 EXIF фотографии\n' + ('\n'.join(details) if len(details) > 1 else 'EXIF-метаданные не найдены.'))
+    except Exception:
+        await event.edit('Не удалось прочитать фотографию или её метаданные.')
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+async def parody_dox_handler(event):
+    if not await check_is_owner(event):
+        return
+    await event.edit(
+        '🎭 <b>ПАРОДИЯ — ВСЁ ВЫДУМАНО</b>\n\n'
+        'Объект: секретный агент Печенька\n'
+        'Место жительства: Облачное королевство\n'
+        'Уровень опасности: 3 из 10 печенек\n'
+        'Любимое занятие: искать чай\n\n'
+        '<i>Это шуточный текст. Здесь нет поиска или реальных персональных данных.</i>',
+        parse_mode='HTML'
+    )
+
+
+HELP_TEXT = """📝 Безопасные команды UserBot
+
+.help — эта справка
+.info — публичные данные автора сообщения (ответом)
+.afk [причина] / .unafk — режим отсутствия
+.ping — задержка ответа
+.roll [от] [до] — случайное число
+.ball вопрос — шуточный ответ «магического шара»
+.rps камень|ножницы|бумага — сыграть с ботом
+.calc выражение — безопасный калькулятор
+.coin — подбросить монетку
+.id — ID чата, сообщения и автора (ответом — данные сообщения)
+.link [текст] — ссылка на свой профиль с черновиком сообщения
+.qr текст — создать QR-код
+.weather город — прогноз на завтра
+.iss — координаты Международной космической станции
+.spinf — безопасные EXIF-поля фото (ответом; GPS не показывается)
+.dox — явно шуточная пародия без поиска данных
+.remind 30m текст — напоминание в «Избранное»
+.myreminders / .cancelremind ID — список и отмена напоминаний
+.geo город — ссылка на найденное публичное место
+.blur [0-100] / .chp / .frame — эффекты для фото (ответом)
+.love / .fire / .boom / .magic / .matrix / .heart / .load / .police / .clown — короткие анимации
+.leet текст — преобразовать текст в leet-speak
+.dumb текст — шуточное искажение текста
+.morse текст — код Морзе; повторная команда декодирует код
+.type текст — анимация печати
+.ttt — крестики-нолики (ответом на сообщение соперника)
+.stats — локальная статистика
+"""
 
 
 async def help_handler(event):
     if not await check_is_owner(event):
         return
-    args = event.message.text.split(' ', 1)
-    if len(args) > 1:
-        command = args[1].strip()
-        helps = {
-            'type': '⚙️ Typer\n\n· .type [текст] — Анимация печати текста',
-            'spam': '⚙️ Spam\n\n· .spam [кол-во] [текст или реплай] — Спам (макс 20)',
-            'mute': '⚙️ Mute\n\n· .mute — Замьютить (реплай)\n· .unmute — Размьютить (реплай)',
-            'info': '⚙️ UserInfo\n\n· .info — Информация (реплай)',
-            'deleted': '⚙️ Deleted\n\n· .deleted [N] — Последние N удалённых (макс 20)',
-            'afk': '⚙️ AFK\n\n· .afk [причина] — Включить AFK\n· .unafk — Выключить AFK',
-            'stats': '⚙️ Stats\n\n· .stats — Статистика бота',
-            'dox': '⚙️ Dox\n\n· .dox — Фейк досье (в ответ на сообщение)\n⚠️ Только для развлечения',
-            'deanon': '⚙️ Deanon\n\n· .deanon — Фейк деанон (в ответ на сообщение)\n⚠️ Только для развлечения',
-            'fco': '⚙️ Forecast\n\n· .fco — Предсказание на сегодня',
-            'ttt': '⚙️ TicTacToe\n\n· .ttt — Крестики-нолики (в ответ на сообщение противника)',
-        }
-        await event.edit(helps.get(command, HELP_TEXT), parse_mode='HTML')
-    else:
-        await event.edit(HELP_TEXT, parse_mode='HTML')
+    await event.edit(HELP_TEXT)
 
 
 # === ФОНОВЫЕ ЗАДАЧИ ===
@@ -1723,8 +2165,12 @@ async def reminder_checker():
             rows = cursor.fetchall()
             for rid, uid, text in rows:
                 try:
-                    bot.send_message(uid, f'🔔 <b>Напоминание!</b>\n\n<blockquote>{text}</blockquote>',
-                                     parse_mode='HTML')
+                    if uid == owner_id:
+                        await client.send_message('me', f'🔔 Напоминание!\n\n{text}')
+                    else:
+                        safe_text = html.escape(text)
+                        bot.send_message(uid, f'🔔 <b>Напоминание!</b>\n\n<blockquote>{safe_text}</blockquote>',
+                                         parse_mode='HTML')
                 except Exception as e:
                     print(f"Reminder send error: {e}")
                 cursor.execute('DELETE FROM reminders WHERE id=?', (rid,))
@@ -1755,31 +2201,42 @@ def run_bot():
 
 
 def register_handlers(c):
-    c.add_event_handler(raw_deleted_handler, events.Raw(types.UpdateDeleteMessages))
-    c.add_event_handler(raw_deleted_handler, events.Raw(types.UpdateDeleteChannelMessages))
-
-    c.add_event_handler(mute_handler, events.NewMessage(outgoing=True, pattern=r'^\.mute$'))
-    c.add_event_handler(unmute_handler, events.NewMessage(outgoing=True, pattern=r'^\.unmute$'))
-
     c.add_event_handler(incoming_message_handler, events.NewMessage(incoming=True))
     c.add_event_handler(outgoing_message_handler, events.NewMessage(outgoing=True))
 
     c.add_event_handler(type_handler, events.NewMessage(outgoing=True, pattern=r'^\.type '))
-    c.add_event_handler(spam_handler, events.NewMessage(outgoing=True, pattern=r'^\.spam '))
     c.add_event_handler(info_handler, events.NewMessage(outgoing=True, pattern=r'^\.info$'))
-    c.add_event_handler(deleted_handler, events.NewMessage(outgoing=True, pattern=r'^\.deleted( \d+)?$'))
     c.add_event_handler(help_handler, events.NewMessage(outgoing=True, pattern=r'^\.help( .*)?$'))
     c.add_event_handler(afk_handler, events.NewMessage(outgoing=True, pattern=r'^\.afk( .*)?$'))
     c.add_event_handler(unafk_handler, events.NewMessage(outgoing=True, pattern=r'^\.unafk$'))
     c.add_event_handler(ping_handler, events.NewMessage(outgoing=True, pattern=r'^\.ping$'))
     c.add_event_handler(stats_handler, events.NewMessage(outgoing=True, pattern=r'^\.stats$'))
-    c.add_event_handler(clear_deleted_handler, events.NewMessage(outgoing=True, pattern=r'^\.clear$'))
-    c.add_event_handler(dox_handler, events.NewMessage(outgoing=True, pattern=r'^\.dox$'))
-    c.add_event_handler(deanon_handler, events.NewMessage(outgoing=True, pattern=r'^\.deanon$'))
-    c.add_event_handler(fco_handler, events.NewMessage(outgoing=True, pattern=r'^\.fco$'))
     c.add_event_handler(ttt_handler, events.NewMessage(outgoing=True, pattern=r'^\.ttt$'))
+    c.add_event_handler(roll_handler, events.NewMessage(outgoing=True, pattern=r'^\.roll(?:\s|$)'))
+    c.add_event_handler(ball_handler, events.NewMessage(outgoing=True, pattern=r'^\.(?:8ball|ball)(?:\s|$)'))
+    c.add_event_handler(text_transform_handler, events.NewMessage(outgoing=True, pattern=r'^\.(?:leet|dumb)\s'))
+    c.add_event_handler(morse_handler, events.NewMessage(outgoing=True, pattern=r'^\.morse\s'))
+    c.add_event_handler(rps_handler, events.NewMessage(outgoing=True, pattern=r'^\.rps(?:\s|$)'))
+    c.add_event_handler(calc_handler, events.NewMessage(outgoing=True, pattern=r'^\.calc\s'))
+    c.add_event_handler(coin_handler, events.NewMessage(outgoing=True, pattern=r'^\.coin$'))
+    c.add_event_handler(id_handler, events.NewMessage(outgoing=True, pattern=r'^\.id$'))
+    c.add_event_handler(link_handler, events.NewMessage(outgoing=True, pattern=r'^\.link(?:\s|$)'))
+    c.add_event_handler(qr_handler, events.NewMessage(outgoing=True, pattern=r'^\.qr\s'))
+    c.add_event_handler(weather_handler, events.NewMessage(outgoing=True, pattern=r'^\.weather\s'))
+    c.add_event_handler(iss_handler, events.NewMessage(outgoing=True, pattern=r'^\.iss$'))
+    c.add_event_handler(exif_handler, events.NewMessage(outgoing=True, pattern=r'^\.spinf$'))
+    c.add_event_handler(parody_dox_handler, events.NewMessage(outgoing=True, pattern=r'^\.dox$'))
+    c.add_event_handler(reminder_command_handler, events.NewMessage(outgoing=True, pattern=r'^\.remind(?:\s|$)'))
+    c.add_event_handler(myreminders_handler, events.NewMessage(outgoing=True, pattern=r'^\.myreminders$'))
+    c.add_event_handler(cancelremind_handler, events.NewMessage(outgoing=True, pattern=r'^\.cancelremind(?:\s|$)'))
+    c.add_event_handler(geo_handler, events.NewMessage(outgoing=True, pattern=r'^\.geo\s'))
+    c.add_event_handler(image_effect_handler, events.NewMessage(outgoing=True, pattern=r'^\.(?:blur|chp|frame)(?:\s|$)'))
+    for animation_command in ANIMATIONS:
+        c.add_event_handler(
+            animation_handler,
+            events.NewMessage(outgoing=True, pattern=rf'^\.{animation_command}(?:\s|$)')
+        )
 
-    c.add_event_handler(handler_message_edited, events.MessageEdited)
 
 
 async def main():
